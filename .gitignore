@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+coverage/
+*.log
+.DS_Store
+
+# Working plans are temporary and never published
+.plans/
+
+# Compose bind-mount host path (queue/Redis state lives here)
+/data/

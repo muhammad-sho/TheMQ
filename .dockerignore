@@ -1,0 +1,16 @@
+node_modules
+n8n-nodes-themq
+dist
+coverage
+.git
+.github
+.gitignore
+Dockerfile
+docker-compose.yml
+.env
+.env.*
+!.env.example
+tests
+*.test.ts
+*.md
+!README.md

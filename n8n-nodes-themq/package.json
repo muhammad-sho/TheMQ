@@ -1,0 +1,60 @@
+{
+  "name": "n8n-nodes-themq",
+  "version": "0.4.4",
+  "description": "Native n8n community nodes for TheMQ — a lightweight, Redis-backed queue/consumer message broker.",
+  "keywords": [
+    "n8n-community-node-package",
+    "n8n",
+    "themq",
+    "message-queue",
+    "broker"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/muhammad-sho/TheMQ/tree/main/n8n-nodes-themq",
+  "author": {
+    "name": "TheMQ contributors"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/muhammad-sho/TheMQ.git",
+    "directory": "n8n-nodes-themq"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && npm run copy:icons",
+    "copy:icons": "cp nodes/TheMq/themq.png dist/nodes/TheMq/themq.png && cp nodes/TheMqTrigger/themq.png dist/nodes/TheMqTrigger/themq.png",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint credentials nodes index.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/TheMqApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/TheMq/TheMq.node.js",
+      "dist/nodes/TheMqTrigger/TheMqTrigger.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9.18.0",
+    "n8n-workflow": "^1.0.0",
+    "prettier": "^3.4.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.20.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "dependencies": {
+    "ws": "^8.21.3"
+  }
+}

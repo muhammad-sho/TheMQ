@@ -1,0 +1,51 @@
+name: Publish n8n nodes
+
+on:
+  push:
+    tags:
+      - "n8n-nodes-themq-v*"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-n8n-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: n8n-nodes-themq
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: n8n-nodes-themq/package-lock.json
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF#refs/tags/n8n-nodes-themq-v}"
+          pkg="$(node -p "require('./package.json').version")"
+          test "$tag" = "$pkg" || { echo "Tag v$tag does not match package.json version $pkg"; exit 1; }
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify (typecheck, lint, build)
+        run: npm run typecheck && npm run lint && npm run build
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
