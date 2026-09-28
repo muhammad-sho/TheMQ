@@ -16,7 +16,7 @@ export type MessageState = "ready" | "delayed" | "unacked";
 export interface BrokerMessage {
   id: string;
   queue: string;
-  /** Application payload. A message is simply a message. */
+  /** Application payload. */
   data: Json;
   state: MessageState;
   /** Consumer currently holding the message (`null` unless unacked). */
@@ -92,3 +92,14 @@ export const THEMQ_ERROR_CODES = [
 ] as const;
 
 export type TheMQErrorCode = (typeof THEMQ_ERROR_CODES)[number];
+
+/**
+ * Public broker limits. Enforced per call by API validation and clamped
+ * again in the service layer, so the numbers live here — not copy-pasted
+ * across schemas, config, and the broker.
+ */
+export const LEASE_TIMEOUT_MIN_MS = 100;
+export const LEASE_TIMEOUT_MAX_MS = 43_200_000;
+export const PREFETCH_MAX = 1000;
+export const CONSUME_COUNT_MAX = 1000;
+export const TTL_MAX_MS = 2_592_000_000;

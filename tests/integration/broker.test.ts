@@ -178,6 +178,54 @@ describe("broker publish/consume/ack", () => {
     );
   });
 
+  it("skips on an existing ready message without changing it", async () => {
+    const first = await system.broker.publish("q", { v: 1 }, { id: "msg_skip" });
+    const before = await system.broker.getQueue("q");
+    const skipped = await system.broker.publish(
+      "q",
+      { v: 2 },
+      { id: "msg_skip", onConflict: "skip" },
+    );
+    expect(skipped).toMatchObject({
+      skipped: true,
+      upserted: false,
+      state: "ready",
+      deliveryCount: 0,
+    });
+    expect(skipped.createdAt).toBe(first.createdAt);
+    // Untouched: same data, same depths, no counter movement.
+    expect((await system.broker.getMessage("q", "msg_skip")).data).toEqual({ v: 1 });
+    expect(await system.broker.getQueue("q")).toMatchObject({
+      ready: before.ready,
+      published: before.published,
+    });
+    const consumed = await system.broker.consume("q", { consumerId: "c1", count: 5 });
+    expect(consumed.messages.map((m) => m.id)).toEqual(["msg_skip"]);
+  });
+
+  it("skips on a leased message and leaves the lease intact", async () => {
+    await system.broker.publish("q", { v: 1 }, { id: "msg_skipl" });
+    const leased = await system.broker.consume("q", { consumerId: "c1" });
+    const skipped = await system.broker.publish(
+      "q",
+      { v: 2 },
+      { id: "msg_skipl", onConflict: "skip" },
+    );
+    expect(skipped).toMatchObject({ skipped: true, state: "unacked" });
+    // The lease holder can still ack afterwards: nothing was disturbed.
+    await system.broker.ack("q", "msg_skipl", leased.consumerId);
+    expect((await system.broker.getQueue("q")).unacked).toBe(0);
+  });
+
+  it("skips on a missing id by publishing normally", async () => {
+    const created = await system.broker.publish(
+      "q",
+      { v: 1 },
+      { id: "msg_skipnew", onConflict: "skip" },
+    );
+    expect(created).toMatchObject({ skipped: false, upserted: false, state: "ready" });
+  });
+
   it("shares work across competing consumers without duplicates", async () => {
     for (let i = 0; i < 10; i += 1) {
       await system.broker.publish("q", { n: i }, { id: `msg_w${String(i)}` });

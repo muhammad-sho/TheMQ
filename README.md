@@ -69,10 +69,15 @@ your queues.
 | `401` / unauthorized | Wrong token — compare with the `API_TOKEN` line. |
 | --- | --- |
 | n8n can't reach TheMQ | In-Docker n8n needs `http://themq:3000` on the same network. |
-| Port already in use | Change `"3000:3000"` to `"3001:3000"`. |
+| Port already in use | Set `API_PORT=3001` (maps host `3001` to container `3000`). |
 
 ## Developers
 
 - [docs/API.md](docs/API.md) — API + subscription protocol.
 - [n8n-nodes-themq/README.md](n8n-nodes-themq/README.md) — node reference.
-- [.env.example](.env.example) — optional settings.
+- [.env.example](.env.example) — optional overrides (no `.env` file needed
+  for a normal Docker deployment).
+
+## License
+
+ISC — see [LICENSE](LICENSE).

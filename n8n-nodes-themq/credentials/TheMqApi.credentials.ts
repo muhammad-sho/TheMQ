@@ -19,7 +19,7 @@ export class TheMqApi implements ICredentialType {
       type: "string",
       default: "http://localhost:3000",
       placeholder: "http://themq:3000",
-      description: "Base URL of the TheMQ HTTP API (no trailing slash)",
+      description: "Base URL of TheMQ HTTP API (no trailing slash)",
       required: true,
     },
     {

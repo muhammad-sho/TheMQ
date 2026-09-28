@@ -122,8 +122,9 @@ export function isConnectionError(err: unknown): boolean {
   const record = err as { name?: unknown; code?: unknown; message?: unknown };
   if (typeof record.name === "string" && CONNECTION_ERROR_NAMES.has(record.name)) return true;
   if (typeof record.code === "string" && CONNECTION_ERROR_CODES.has(record.code)) return true;
-  if (typeof record.message === "string") {
-    return CONNECTION_MESSAGE_PATTERNS.some((pattern) => pattern.test(record.message as string));
+  const message = record.message;
+  if (typeof message === "string") {
+    return CONNECTION_MESSAGE_PATTERNS.some((pattern) => pattern.test(message));
   }
   return false;
 }

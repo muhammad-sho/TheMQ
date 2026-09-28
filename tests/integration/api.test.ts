@@ -110,6 +110,52 @@ describe("broker HTTP API", () => {
     expect(stats.ready).toBe(1);
   });
 
+  it("skips on conflict instead of failing when asked", async () => {
+    await fetch(`${base}/queues/sk`, { method: "PUT" });
+    const post = (body: unknown): Promise<Response> =>
+      fetch(`${base}/queues/sk/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+    let res = await post({ id: "msg_sk", data: { v: 1 } });
+    expect(res.status).toBe(201);
+
+    // Queued duplicate: 200 with the current state, message untouched.
+    res = await post({ id: "msg_sk", data: { v: 2 }, onConflict: "skip" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      id: "msg_sk",
+      skipped: true,
+      upserted: false,
+      state: "ready",
+    });
+    res = await fetch(`${base}/queues/sk/messages/msg_sk`);
+    expect(await res.json()).toMatchObject({ data: { v: 1 } });
+
+    // Leased duplicate: 200 with unacked state, lease holder still acks fine.
+    res = await fetch(`${base}/queues/sk/consume`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ consumerId: "worker-1" }),
+    });
+    expect(res.status).toBe(200);
+    res = await post({ id: "msg_sk", data: { v: 3 }, onConflict: "skip" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ skipped: true, state: "unacked" });
+    res = await fetch(`${base}/queues/sk/messages/msg_sk/ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ consumerId: "worker-1" }),
+    });
+    expect(res.status).toBe(200);
+
+    // Unknown policy value is a validation error, not a publish.
+    res = await post({ id: "msg_sk2", data: { v: 1 }, onConflict: "replace" });
+    expect(res.status).toBe(400);
+  });
+
   it("deletes a queued message so consumers never see it", async () => {
     await fetch(`${base}/queues/del`, { method: "PUT" });
     for (const id of ["msg_1", "msg_2"]) {

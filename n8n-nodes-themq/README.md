@@ -1,6 +1,6 @@
 # n8n-nodes-themq
 
-Native n8n community nodes for [TheMQ](../README.md) — a lightweight,
+Native n8n community nodes for [TheMQ](https://github.com/muhammad-sho/TheMQ) — a lightweight,
 Redis-backed message broker built around queues and consumers.
 
 ## Install
@@ -8,7 +8,7 @@ Redis-backed message broker built around queues and consumers.
 In n8n: **Settings → Community Nodes → Install** → `n8n-nodes-themq`.
 Or `npm install n8n-nodes-themq` in `~/.n8n`, then restart n8n.
 
-Add an **TheMQ API** credential: the TheMQ **Base URL**
+Add a **TheMQ API** credential: the TheMQ **Base URL**
 (e.g. `http://themq:3000`) and the **API Token** — the `API_TOKEN` value
 pinned in `docker-compose.yml` (overridable via environment).
 
@@ -44,7 +44,7 @@ on this mode:
 - **Execution Finishes Successfully** — acknowledged only on success. On
   failure the message goes back to the queue and is delivered again
   (with `redelivered: true` and a higher `deliveryCount`).
-- **Specified Later in Workflow** — the trigger does not settle. Add an
+- **Specified Later in Workflow** — the trigger does not settle. Add a
   **TheMQ → Acknowledge** node where the message is truly done; its
   fields pick up the trigger item automatically. If the run ends without
   acknowledgement, success acknowledges and failure returns the message.
@@ -92,7 +92,7 @@ queue, not for ones already delivered.)
 
 ### Troubleshooting
 
-**"Timed out waiting for the TheMQ hello reply" on activation.**
+**"Timed out waiting for a TheMQ hello reply" on activation.**
 The trigger opened the connection but the server never answered. Check,
 in order:
 
@@ -121,7 +121,9 @@ Publish · Acknowledge · Delete Message
 
 - **Publish** — Queue, Message ID (required; the upsert key), Message
   Data, Upsert flag (update the ID in place instead of conflicting),
-  Delay (wait before the message becomes available).
+  On Conflict (Error, or Skip to return the existing message's state with
+  `skipped: true` instead of failing — works for queued and leased
+  messages), Delay (wait before the message becomes available).
 - **Acknowledge** — marks a trigger-delivered message as successfully
   processed. Queue, Message ID, and Consumer ID default to the trigger
   item, so no wiring is needed.
@@ -175,14 +177,14 @@ npm run build        # tsc -> dist/ (+ icons)
 ## Publish
 
 Releases are published to npm by the [`publish-n8n`
-workflow](../.github/workflows/publish-n8n.yml), which uses the
-`NPM_TOKEN` repository secret:
+workflow](https://github.com/muhammad-sho/TheMQ/blob/main/.github/workflows/publish-n8n.yml),
+which uses the `NPM_TOKEN` repository secret:
 
 ```bash
 npm version patch|minor|major   # bumps n8n-nodes-themq/package.json
 git push origin main
-git tag n8n-nodes-themq-v0.4.4  # must match package.json
-git push origin n8n-nodes-themq-v0.4.4
+git tag n8n-nodes-themq-v0.5.0  # must match package.json
+git push origin n8n-nodes-themq-v0.5.0
 ```
 
 Pushing the tag builds, verifies, and runs `npm publish --access public`.

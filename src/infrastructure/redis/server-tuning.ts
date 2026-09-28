@@ -63,8 +63,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Snapshot retry budget while a background save is already running. */
+const BGSAVE_MAX_ATTEMPTS = 6;
+const BGSAVE_RETRY_DELAY_MS = 2000;
+
 async function bgsaveWhenIdle(client: TuningClient, logger?: Logger): Promise<void> {
-  for (let attempt = 0; ; attempt++) {
+  for (let attempt = 0; attempt < BGSAVE_MAX_ATTEMPTS; attempt++) {
     try {
       await client.bgsave();
       return;
@@ -74,7 +78,7 @@ async function bgsaveWhenIdle(client: TuningClient, logger?: Logger): Promise<vo
           ? /already in progress|in progress|schedule/i.test(err.message)
           : false;
       if (busy && attempt < 5) {
-        await sleep(2000);
+        await sleep(BGSAVE_RETRY_DELAY_MS);
         continue;
       }
       // A missed startup snapshot is not fatal (save points still fire),

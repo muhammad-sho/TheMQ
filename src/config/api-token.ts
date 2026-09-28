@@ -7,6 +7,11 @@ function withToken(config: AppConfig, apiToken: string): AppConfig {
   return { ...config, apiToken };
 }
 
+/** 256-bit token, URL-safe for headers and compose files. */
+function generateToken(): string {
+  return randomBytes(32).toString("base64url");
+}
+
 /**
  * Ensure a bearer token exists when auth is enabled. Hierarchy: pinned
  * `API_TOKEN` > Redis-persisted token (stable across restarts) >
@@ -27,7 +32,7 @@ export async function resolveApiAuth(
 
   const key = `${config.redisKeyPrefix}:auth:api-token`;
   const hint = `fetch it with: redis-cli GET ${key}`;
-  const candidate = randomBytes(32).toString("base64url");
+  const candidate = generateToken();
   const created = await redis.set(key, candidate, "NX");
   if (created === "OK") {
     logger?.info(
@@ -47,7 +52,7 @@ export async function resolveApiAuth(
   }
 
   // Rare race: NX lost but the key vanished before GET.
-  const retry = randomBytes(32).toString("base64url");
+  const retry = generateToken();
   const retryCreated = await redis.set(key, retry, "NX");
   const resolved = retryCreated === "OK" ? retry : await redis.get(key);
   if (resolved === null || resolved === "") {

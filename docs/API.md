@@ -66,14 +66,14 @@ Failures return a stable body, never backend internals:
 Declare (idempotent; returns `{queue, created}`):
 
 ```bash
-curl -X PUT -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders
+curl -s -X PUT -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders
 ```
 
 List all queues with `ready` / `delayed` / `unacked` depths (up to 1000
 queues, sorted by name):
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" localhost:3000/queues
+curl -s -H "Authorization: Bearer $TOKEN" localhost:3000/queues
 ```
 
 Inspect one queue — depths, per-consumer leases (up to 1000 consumers),
@@ -81,14 +81,14 @@ lifetime counters (`published`, `delivered`, `acked`, `requeued`,
 `deleted`, `updated`):
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders
+curl -s -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders
 ```
 
 Delete a queue and every message in it (`204`). In-flight acks for its
 leases afterwards `404`; persistent subscribers are disconnected:
 
 ```bash
-curl -X DELETE -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders
 ```
 
 Publishing to a missing queue declares it automatically.
@@ -104,10 +104,11 @@ curl -s -X POST localhost:3000/queues/orders/messages \
 Body: `id` (**required** — the message key, never generated), `data`
 (required, arbitrary JSON), `ttlMs` (optional delay in ms before the
 message becomes available; `0` = immediately), `upsert` (optional boolean,
-default `false`).
+default `false`), `onConflict` (optional `"error"` or `"skip"`, default
+`"error"`).
 
 - New id → `201 Created`: `{id, queue, state, availableAt, createdAt,
-  upserted: false, deliveryCount: 0}`.
+  upserted: false, skipped: false, deliveryCount: 0}`.
 - Existing id without `upsert` → `409 CONFLICT`.
 - Existing id with `"upsert": true` → `200 OK` with `upserted: true`: the
   message is updated in place with the new data and TTL, as if freshly
@@ -116,12 +117,17 @@ default `false`).
   copy ever exists.
 - Upserting a leased (`unacked`) message → `409 CONFLICT` — ack or requeue
   it first, exactly like delete and TTL changes.
+- Existing id (queued or leased) with `"onConflict": "skip"` → `200 OK`
+  with `skipped: true` and the message's current `state`, `availableAt`,
+  `createdAt`, and `deliveryCount`. Nothing is changed: no counters move,
+  the ready position stays, and any lease stays intact (its holder can
+  still ack). Use this when a conflict is an expected state, not an error.
 - Payloads over `MAX_MESSAGE_BYTES` → `400`.
 
 ## Inspect a message
 
 ```bash
-curl -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders/messages/msg_123
+curl -s -H "Authorization: Bearer $TOKEN" localhost:3000/queues/orders/messages/msg_123
 ```
 
 Returns the full message format above. Missing messages → `404`.
@@ -205,11 +211,11 @@ messages per consumer through the same atomic path as HTTP consume.
 ## Acknowledge / requeue
 
 ```bash
-curl -X POST localhost:3000/queues/orders/messages/msg_123/ack \
+curl -s -X POST localhost:3000/queues/orders/messages/msg_123/ack \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"consumerId":"worker-1"}'
 
-curl -X POST localhost:3000/queues/orders/messages/msg_123/requeue \
+curl -s -X POST localhost:3000/queues/orders/messages/msg_123/requeue \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"consumerId":"worker-1"}'
 ```
@@ -227,7 +233,7 @@ curl -X POST localhost:3000/queues/orders/messages/msg_123/requeue \
 ## Delete a queued message
 
 ```bash
-curl -X DELETE -H "Authorization: Bearer $TOKEN" \
+curl -s -X DELETE -H "Authorization: Bearer $TOKEN" \
   localhost:3000/queues/orders/messages/msg_123
 ```
 
@@ -238,7 +244,7 @@ requeue first).
 ## Change/reset a message TTL
 
 ```bash
-curl -X PUT localhost:3000/queues/orders/messages/msg_123/ttl \
+curl -s -X PUT localhost:3000/queues/orders/messages/msg_123/ttl \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
   -d '{"ttl":60000}'
 ```
@@ -252,7 +258,7 @@ leased messages → `409`.
 ## Cancel a consumer
 
 ```bash
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+curl -s -X POST -H "Authorization: Bearer $TOKEN" \
   localhost:3000/queues/orders/consumers/worker-1/cancel
 ```
 

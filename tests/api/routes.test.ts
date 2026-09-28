@@ -52,6 +52,8 @@ function mockBroker(): BrokerService {
         availableAt: 1,
         createdAt: 1,
         upserted: false,
+        skipped: false,
+        deliveryCount: 0,
       }),
     ),
     getMessage: vi.fn().mockImplementation((queue: string, id: string) =>

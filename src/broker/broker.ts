@@ -24,6 +24,7 @@ import type {
   QueueStats,
   QueueSummary,
 } from "./types.js";
+import { LEASE_TIMEOUT_MAX_MS, LEASE_TIMEOUT_MIN_MS, PREFETCH_MAX } from "./types.js";
 
 export interface BrokerOptions {
   prefix: string;
@@ -43,7 +44,16 @@ export interface PublishOptions {
    * conflict. Leased messages always conflict, even with upsert.
    */
   upsert?: boolean | undefined;
+  /**
+   * What to do when the id already exists (queued or leased): `'error'`
+   * rejects with 409, `'skip'` leaves the message untouched and reports
+   * its current state instead.
+   */
+  onConflict?: PublishConflictPolicy | undefined;
 }
+
+/** Conflict policy for publish-with-existing-id. */
+export type PublishConflictPolicy = "error" | "skip";
 
 export interface PublishedMessage {
   id: string;
@@ -53,6 +63,10 @@ export interface PublishedMessage {
   createdAt: number;
   /** True when an existing message was updated instead of created. */
   upserted: boolean;
+  /** True when an existing message was left untouched (onConflict: skip). */
+  skipped: boolean;
+  /** Deliveries so far (0 for new/upserted, current count when skipped). */
+  deliveryCount: number;
 }
 
 export interface ConsumeOptions {
@@ -64,6 +78,18 @@ export interface ConsumeOptions {
 }
 
 type ScriptCaller = (...args: Array<string | number>) => Promise<unknown>;
+
+/** Bounds for monitoring reads so fleet size never drives reply size. */
+const MAX_LIST_QUEUES = 1000;
+const MAX_LIST_CONSUMERS = 1000;
+/** SCAN batch size for queue deletion and consumer cancellation. */
+const SCAN_COUNT = 500;
+/** SCAN rounds per delete-queue attempt before returning PARTIAL. */
+const DELETE_MAX_ITERS = 200;
+/** Delete-queue retry budget while consumers drain. */
+const DELETE_MAX_ATTEMPTS = 5;
+/** Cancel-consumer page bound so a giant consumer set cannot loop forever. */
+const CANCEL_MAX_PAGES = 100;
 
 /** Fired when a queue may have messages available (drives push consumers). */
 export type BrokerChangeHandler = (queue: string) => void;
@@ -122,6 +148,13 @@ function flatToRecord(value: unknown, script: string): Record<string, string> {
     record[asString(items[i], script)] = asString(items[i + 1], script);
   }
   return record;
+}
+
+/** Leased messages can only be settled, never overwritten or deleted. */
+function unackedConflict(queue: string, id: string): ApiError {
+  return new ApiError("CONFLICT", `Message '${id}' is unacked; ack or requeue it first.`, {
+    resource: { type: "message", id, queue },
+  });
 }
 
 function parseMessageHash(record: Record<string, string>, queue: string): BrokerMessage {
@@ -209,8 +242,8 @@ export class BrokerService {
     };
   }
 
-  private notifyChanged(queue: string): void {
-    for (const handler of this.changeHandlers) {
+  private notifyEach(handlers: Set<(queue: string) => void>, queue: string): void {
+    for (const handler of handlers) {
       try {
         handler(queue);
       } catch {
@@ -219,14 +252,12 @@ export class BrokerService {
     }
   }
 
+  private notifyChanged(queue: string): void {
+    this.notifyEach(this.changeHandlers, queue);
+  }
+
   private notifyDeleted(queue: string): void {
-    for (const handler of this.deleteHandlers) {
-      try {
-        handler(queue);
-      } catch {
-        // ignore — listeners must never break broker mutations
-      }
-    }
+    this.notifyEach(this.deleteHandlers, queue);
   }
 
   /** Idempotent queue declaration. */
@@ -247,12 +278,11 @@ export class BrokerService {
 
   async listQueues(): Promise<QueueSummary[]> {
     // Bounded pipeline: monitoring must not grow with fleet size.
-    const MAX_QUEUES = 1000;
     try {
       const names = await this.redis.smembers(queueKeys(this.options.prefix, "").registry);
       const sorted = [...names].sort();
       if (sorted.length === 0) return [];
-      const shown = sorted.slice(0, MAX_QUEUES);
+      const shown = sorted.slice(0, MAX_LIST_QUEUES);
       const pipeline = this.redis.pipeline();
       for (const name of shown) {
         const keys = queueKeys(this.options.prefix, name);
@@ -313,8 +343,7 @@ export class BrokerService {
     const ids: string[] = [];
     const prefetches = new Map<string, number>();
     // Bounded like listQueues.
-    const MAX_CONSUMERS = 1000;
-    for (let i = 0; i + 1 < consumersFlat.length && ids.length < MAX_CONSUMERS; i += 2) {
+    for (let i = 0; i + 1 < consumersFlat.length && ids.length < MAX_LIST_CONSUMERS; i += 2) {
       const id = asString(consumersFlat[i], "stats");
       const prefetch = asNumber(consumersFlat[i + 1], "stats");
       ids.push(id);
@@ -366,7 +395,7 @@ export class BrokerService {
   async deleteQueue(queue: string): Promise<void> {
     const keys = queueKeys(this.options.prefix, queue);
     const match = `${escapeGlob(keys.messagePrefix)}*`;
-    for (let attempt = 0; attempt < 5; attempt += 1) {
+    for (let attempt = 0; attempt < DELETE_MAX_ATTEMPTS; attempt += 1) {
       let reply: unknown;
       try {
         reply = await this.call("themqDeleteQueue", [
@@ -379,8 +408,8 @@ export class BrokerService {
           queue,
           match,
           keys.pendingPrefix,
-          500,
-          200,
+          SCAN_COUNT,
+          DELETE_MAX_ITERS,
         ]);
       } catch (err) {
         throw classifyBackendError(err, "delete queue");
@@ -424,28 +453,45 @@ export class BrokerService {
         availableAt,
         now,
         opts.upsert === true ? 1 : 0,
+        opts.onConflict === "skip" ? "skip" : "error",
       ]);
     } catch (err) {
       throw classifyBackendError(err, "publish message");
     }
     const parts = asArray(reply, "publish");
     const status = asString(parts[0], "publish");
+    if (status === "SKIPPED") {
+      // Untouched by definition: no counters moved, no lease changed, so
+      // no change notification either.
+      const skippedState = asString(parts[1], "publish");
+      if (!isMessageState(skippedState)) {
+        throw ApiError.internal("Unexpected reply from publish.");
+      }
+      return {
+        id,
+        queue,
+        state: skippedState,
+        availableAt: asNumber(parts[2], "publish"),
+        createdAt: asNumber(parts[3], "publish"),
+        upserted: false,
+        skipped: true,
+        deliveryCount: asNumber(parts[4], "publish"),
+      };
+    }
     if (status === "CONFLICT") {
       throw new ApiError("CONFLICT", `Message '${id}' already exists.`, {
         resource: { type: "message", id, queue },
       });
     }
     if (status === "LEASED") {
-      throw new ApiError("CONFLICT", `Message '${id}' is unacked; ack or requeue it first.`, {
-        resource: { type: "message", id, queue },
-      });
+      throw unackedConflict(queue, id);
     }
     const state = asString(parts[1], "publish");
     if (!isMessageState(state)) throw ApiError.internal("Unexpected reply from publish.");
     const upserted = asNumber(parts[2], "publish") === 1;
     const createdAt = asNumber(parts[3], "publish");
     this.notifyChanged(queue);
-    return { id, queue, state, availableAt, createdAt, upserted };
+    return { id, queue, state, availableAt, createdAt, upserted, skipped: false, deliveryCount: 0 };
   }
 
   async getMessage(queue: string, id: string): Promise<BrokerMessage> {
@@ -468,11 +514,14 @@ export class BrokerService {
     // Clamp the lease and never let an invalid prefetch wedge the
     // stored per-consumer cap at zero.
     const visibilityMs = Math.min(
-      Math.max(opts.visibilityTimeoutMs ?? this.options.defaultVisibilityTimeoutMs, 100),
-      43_200_000,
+      Math.max(
+        opts.visibilityTimeoutMs ?? this.options.defaultVisibilityTimeoutMs,
+        LEASE_TIMEOUT_MIN_MS,
+      ),
+      LEASE_TIMEOUT_MAX_MS,
     );
     const prefetch =
-      opts.prefetch === undefined || opts.prefetch < 1 ? -1 : Math.min(opts.prefetch, 1000);
+      opts.prefetch === undefined || opts.prefetch < 1 ? -1 : Math.min(opts.prefetch, PREFETCH_MAX);
     const now = Date.now();
     let reply: unknown;
     try {
@@ -490,7 +539,7 @@ export class BrokerService {
         prefetch,
         visibilityMs,
         now,
-        500,
+        SCAN_COUNT,
         keys.messagePrefix,
         keys.pendingPrefix,
         this.options.defaultPrefetch,
@@ -609,9 +658,7 @@ export class BrokerService {
     const status = asString(parts[0], "deleteMessage");
     if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
     if (status === "CONFLICT") {
-      throw new ApiError("CONFLICT", `Message '${id}' is unacked; ack or requeue it first.`, {
-        resource: { type: "message", id, queue },
-      });
+      throw unackedConflict(queue, id);
     }
     const state = asString(parts[1], "deleteMessage");
     if (!isMessageState(state)) throw ApiError.internal("Unexpected reply from deleteMessage.");
@@ -644,9 +691,7 @@ export class BrokerService {
     const status = asString(parts[0], "setTtl");
     if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
     if (status === "CONFLICT") {
-      throw new ApiError("CONFLICT", `Message '${id}' is unacked; ack or requeue it first.`, {
-        resource: { type: "message", id, queue },
-      });
+      throw unackedConflict(queue, id);
     }
     const state = asString(parts[1], "setTtl");
     if (!isMessageState(state)) throw ApiError.internal("Unexpected reply from setTtl.");
@@ -660,7 +705,7 @@ export class BrokerService {
     let cursor = "0";
     let requeued = 0;
     // Page the pending set instead of loading it whole.
-    for (let page = 0; page < 100; page += 1) {
+    for (let page = 0; page < CANCEL_MAX_PAGES; page += 1) {
       let reply: unknown;
       try {
         reply = await this.call("themqCancelConsumer", [
@@ -673,7 +718,7 @@ export class BrokerService {
           now,
           keys.messagePrefix,
           cursor,
-          500,
+          SCAN_COUNT,
         ]);
       } catch (err) {
         throw classifyBackendError(err, "cancel consumer");
@@ -699,7 +744,7 @@ export class BrokerService {
         keys.delayed,
         keys.unacked,
         Date.now(),
-        500,
+        SCAN_COUNT,
         keys.pendingPrefix,
         keys.messagePrefix,
       ]);

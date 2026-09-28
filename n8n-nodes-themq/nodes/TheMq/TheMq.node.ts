@@ -24,6 +24,10 @@ function numParam(value: NodeParameterValueType | object, fallback: number): num
   return typeof value === "number" ? value : fallback;
 }
 
+function boolParam(value: NodeParameterValueType | object, fallback = false): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
 export class TheMq implements INodeType {
   description: INodeTypeDescription = {
     displayName: "TheMQ",
@@ -99,7 +103,7 @@ export class TheMq implements INodeType {
         default: '{\n  "message": "hello"\n}',
         required: true,
         displayOptions: { show: { operation: ["publish"] } },
-        description: "Arbitrary JSON payload — a message is simply a message",
+        description: "Arbitrary JSON payload for the message",
       },
       {
         displayName: "Upsert",
@@ -109,6 +113,30 @@ export class TheMq implements INodeType {
         displayOptions: { show: { operation: ["publish"] } },
         description:
           "Update the message in place when the ID already exists (new data and delay), instead of failing with a conflict.",
+      },
+      {
+        displayName: "On Conflict",
+        name: "onConflict",
+        type: "options",
+        default: "error",
+        displayOptions: { show: { operation: ["publish"] } },
+        options: [
+          {
+            name: "Error",
+            value: "error",
+            description: "Fail with a conflict error when the ID already exists",
+            action: "Fail on conflict",
+          },
+          {
+            name: "Skip",
+            value: "skip",
+            description:
+              "Leave the existing message untouched and return its current state with skipped: true",
+            action: "Skip on conflict",
+          },
+        ],
+        description:
+          "What to do when the message ID already exists (queued or leased). Upsert above takes precedence when enabled.",
       },
       {
         displayName: "Delay (Ms)",
@@ -150,13 +178,25 @@ export class TheMq implements INodeType {
         }
         if (operation === "publish") {
           const dataParam: unknown = this.getNodeParameter("messageData", i);
-          const data: unknown =
-            typeof dataParam === "string" ? (JSON.parse(dataParam) as unknown) : dataParam;
+          let data: unknown;
+          if (typeof dataParam === "string") {
+            try {
+              data = JSON.parse(dataParam) as unknown;
+            } catch {
+              throw new NodeOperationError(this.getNode(), "Message Data is not valid JSON.", {
+                itemIndex: i,
+              });
+            }
+          } else {
+            data = dataParam;
+          }
           const ttlMs = numParam(this.getNodeParameter("ttlMs", i, 0), 0);
-          const upsert = this.getNodeParameter("upsert", i, false);
+          const upsert = boolParam(this.getNodeParameter("upsert", i, false));
+          const onConflict = strParam(this.getNodeParameter("onConflict", i, "error"), "error");
           const body: Record<string, unknown> = { id: messageId, data };
           if (ttlMs > 0) body["ttlMs"] = ttlMs;
-          if (upsert === true) body["upsert"] = true;
+          if (upsert) body["upsert"] = true;
+          if (onConflict === "skip") body["onConflict"] = "skip";
           const response = await request.call(
             this,
             "POST",
@@ -181,7 +221,7 @@ export class TheMq implements INodeType {
           // Resolve a waiting trigger fast (best-effort: the HTTP
           // acknowledgement above already settled).
           try {
-            this.sendResponse({ ...items[i]?.json, acknowledged: true });
+            this.sendResponse({ ...items[i]?.json, acked: true });
           } catch {
             // ignore — standalone acknowledgement already succeeded
           }
@@ -219,6 +259,11 @@ function encode(value: string): string {
   return encodeURIComponent(value);
 }
 
+/** Strip trailing slashes so `baseUrl + path` never doubles them. */
+export function normalizeBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "");
+}
+
 export interface RequestContext {
   itemIndex: number;
   operation: string;
@@ -237,7 +282,7 @@ async function request(
   const credentials = (await this.getCredentials("theMqApi")) as unknown as {
     baseUrl?: string;
   };
-  const baseUrl = (credentials.baseUrl ?? "").replace(/\/+$/, "");
+  const baseUrl = normalizeBaseUrl(credentials.baseUrl ?? "");
   try {
     return toDataObject(
       await this.helpers.requestWithAuthentication.call(this, "theMqApi", {
@@ -255,8 +300,8 @@ async function request(
   }
 }
 
-/** Next step per TheMQ error code (empty = the message says it all). */
-function hintForCode(code: string, operation: string): string {
+/** One-line remediation per TheMQ error code (empty = the message says it all). */
+function hintForCode(code: string, operation: string, message: string): string {
   switch (code) {
     case "UNAUTHENTICATED":
       return "Check the API Token in your TheMQ API credential.";
@@ -264,14 +309,17 @@ function hintForCode(code: string, operation: string): string {
       return "The queue or message does not exist, or was already removed.";
     case "CONFLICT":
       if (operation === "publish") {
-        return "A message with this ID already exists. Enable Upsert to update it.";
+        if (/unacked|lease/i.test(message)) {
+          return "The message is leased to a consumer. Set On Conflict to Skip, or wait for the lease to settle.";
+        }
+        return "A message with this ID already exists. Enable Upsert to update it, or set On Conflict to Skip.";
       }
       if (operation === "ack") {
         return "The message is not leased to this consumer. It may already be settled, expired, or held by another consumer — check the Consumer ID.";
       }
       return "The message is leased (unacked). Acknowledge it first.";
     case "SERVICE_UNAVAILABLE":
-      return "TheMQ cannot reach its Redis backend. Check the TheMQ server.";
+      return "TheMQ cannot reach its Redis backend. Check that TheMQ and Redis are running.";
     default:
       return "";
   }
@@ -302,7 +350,7 @@ export function describeApiError(
     if (typeof apiError !== "object" || apiError === null) continue;
     const { code, message } = apiError as { code?: unknown; message?: unknown };
     if (typeof code === "string" && typeof message === "string") {
-      const hint = hintForCode(code, context.operation);
+      const hint = hintForCode(code, context.operation, message);
       return `TheMQ ${code}: ${message} [${where}${id}]${hint === "" ? "" : ` ${hint}`}`;
     }
   }

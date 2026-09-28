@@ -110,13 +110,21 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
       if (handle) {
         const done = handle;
         handle = undefined;
-        subscriptions.remove(done);
-        // Requeue pending messages so unacknowledged work is redelivered.
-        void broker.cancelConsumer(queue, done.consumerId).catch((err: unknown) => {
-          logger.warn({ err, queue, event: "cancel-failed" }, "Cancel on disconnect failed");
-        });
+        void dropRegistration(done);
       }
       logger.info({ event: "unsubscribed", queue, consumer: consumerId }, "Consumer disconnected");
+    };
+
+    /**
+     * Forget a registration and requeue its pending messages so
+     * unacknowledged work is redelivered. Shared by disconnect cleanup
+     * and mid-subscribe aborts.
+     */
+    const dropRegistration = async (sub: SubscriberHandle): Promise<void> => {
+      subscriptions.remove(sub);
+      await broker.cancelConsumer(queue, sub.consumerId).catch((err: unknown) => {
+        logger.warn({ err, queue, event: "cancel-failed" }, "Cancel on disconnect failed");
+      });
     };
 
     let frameChain: Promise<void> = Promise.resolve();
@@ -178,10 +186,7 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
         if (settled) {
           // Socket closed mid-subscribe: drop the fresh registration
           // instead of leaking a dead consumer.
-          subscriptions.remove(sub);
-          await broker.cancelConsumer(queue, sub.consumerId).catch((err: unknown) => {
-            logger.warn({ err, queue, event: "cancel-failed" }, "Cancel on disconnect failed");
-          });
+          await dropRegistration(sub);
           return;
         }
         handle = sub;

@@ -13,7 +13,12 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ["dist/**", "node_modules/**", "coverage/**"],
+    ignores: ["dist/**", "node_modules/**", "coverage/**", "data/**"],
+  },
+  {
+    // Plain configs outside tsconfig: lint without type information.
+    files: ["eslint.config.js", "vitest.config.ts", "prettier.config.js"],
+    ...tseslint.configs.disableTypeChecked,
   },
   {
     rules: {

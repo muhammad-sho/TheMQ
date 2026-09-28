@@ -1,6 +1,5 @@
-import type { AppInstance } from "../server.js";
+import type { AppInstance, ApiServices } from "../server.js";
 import { ApiError } from "../errors.js";
-import type { ApiServices } from "../server.js";
 
 export function registerHealthRoutes(app: AppInstance, services: ApiServices): void {
   const { healthService } = services;

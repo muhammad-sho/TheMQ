@@ -4,13 +4,17 @@ services:
     container_name: themq
     hostname: themq
     restart: unless-stopped
+    depends_on:
+      - redis
     ports:
-      - "3000:3000"
+      - "${API_PORT:-3000}:3000"
     environment:
       # Pinned API token (used as the n8n credential + Bearer token).
       # Override without editing: API_TOKEN=your-own-token docker compose up -d
       # Change this value for any non-local deployment.
       API_TOKEN: ${API_TOKEN:-VoUZ9gJutnb8WEKyAYS5m2yVViEVb6L3aOzWMEtEuSo}
+      # Matches the image default (Docker network service name).
+      REDIS_URL: redis://redis:6379
 
   redis:
     image: redis:7-alpine

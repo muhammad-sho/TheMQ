@@ -1,5 +1,4 @@
-import type { AppInstance } from "../server.js";
-import type { ApiServices } from "../server.js";
+import type { AppInstance, ApiServices } from "../server.js";
 import {
   consumeSchema,
   leaseBodySchema,
@@ -19,9 +18,10 @@ export function registerMessageRoutes(app: AppInstance, services: ApiServices): 
       id: input.id,
       ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
       ...(input.upsert === true ? { upsert: true } : {}),
+      ...(input.onConflict === "skip" ? { onConflict: "skip" as const } : {}),
     });
-    // 201 for a new message, 200 when an existing id was updated.
-    return reply.status(published.upserted ? 200 : 201).send({ ...published, deliveryCount: 0 });
+    // 201 for a new message, 200 when an existing id was updated or skipped.
+    return reply.status(published.upserted || published.skipped ? 200 : 201).send({ ...published });
   });
 
   app.post("/queues/:queue/consume", async (request) => {

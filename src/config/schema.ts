@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+  CONSUME_COUNT_MAX,
+  LEASE_TIMEOUT_MAX_MS,
+  LEASE_TIMEOUT_MIN_MS,
+  PREFETCH_MAX,
+} from "../broker/types.js";
 
 export const logLevelSchema = z.enum([
   "fatal",
@@ -33,9 +39,9 @@ export const configSchema = z.object({
   apiPort: z.number().int().min(0).max(65535),
   apiToken: z.string().min(1).optional(),
   authDisabled: z.boolean(),
-  defaultVisibilityTimeoutMs: z.number().int().min(100).max(43_200_000),
-  defaultPrefetch: z.number().int().min(1).max(1000),
-  maxConsumeCount: z.number().int().min(1).max(1000),
+  defaultVisibilityTimeoutMs: z.number().int().min(LEASE_TIMEOUT_MIN_MS).max(LEASE_TIMEOUT_MAX_MS),
+  defaultPrefetch: z.number().int().min(1).max(PREFETCH_MAX),
+  maxConsumeCount: z.number().int().min(1).max(CONSUME_COUNT_MAX),
   sweeperIntervalMs: z.number().int().min(100).max(60_000),
   maxMessageBytes: z.number().int().min(1024).max(100_000_000),
   logLevel: logLevelSchema,

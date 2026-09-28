@@ -10,7 +10,7 @@ import type {
   ITriggerResponse,
 } from "n8n-workflow";
 import { NodeConnectionTypes, NodeOperationError } from "n8n-workflow";
-import { describeApiError } from "../TheMq/TheMq.node.js";
+import { describeApiError, normalizeBaseUrl } from "../TheMq/TheMq.node.js";
 
 type AcknowledgeMode =
   "immediately" | "executionFinishes" | "executionFinishesSuccessfully" | "laterMessageNode";
@@ -39,6 +39,23 @@ interface ReadyInfo {
   early: DeliveredMessage[];
 }
 
+type RaceResult = { kind: "hook"; real: boolean } | { kind: "run"; data: IRun };
+
+/** Bounds mirror the server contract (100ms – 12h lease). */
+const LEASE_MIN_MS = 100;
+const LEASE_MAX_MS = 43_200_000;
+const LEASE_DEFAULT_MS = 60_000;
+const MAX_CONCURRENT_CAP = 1000;
+const IMMEDIATE_PREFETCH = 1000;
+const MANUAL_PREFETCH = 1;
+const CONNECT_TIMEOUT_MS = 15_000;
+const HELLO_TIMEOUT_MS = 15_000;
+const SETTLE_TIMEOUT_MS = 10_000;
+const CLOSE_GRACE_MS = 5000;
+const CLOSE_WAIT_MAX_ROUNDS = 60;
+const CLOSE_WAIT_INTERVAL_MS = 1000;
+const WS_NORMAL_CLOSE = 1000;
+
 /** A message the broker failed to settle because it is already gone. */
 function isAlreadySettled(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
@@ -59,6 +76,17 @@ function frameText(raw: WebSocket.RawData): string {
   if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");
   if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString("utf8");
   return raw.toString("utf8");
+}
+
+/** Extract a delivered message from a parsed frame (undefined = not a message). */
+function parseDeliveredMessage(frame: IDataObject): DeliveredMessage | undefined {
+  if (frame["type"] !== "message" || typeof frame["id"] !== "string") return undefined;
+  return {
+    id: frame["id"],
+    data: frame["data"],
+    deliveryCount: typeof frame["deliveryCount"] === "number" ? frame["deliveryCount"] : 1,
+    redelivered: frame["redelivered"] === true,
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -92,9 +120,9 @@ export class TheMqTrigger implements INodeType {
       header: "",
       executionsHelp: {
         inactive:
-          "<b>While building your workflow</b>, click the 'execute step' button, then publish a message to the TheMQ queue. This will trigger an execution, which will show up in this editor.<br /> <br /><b>Once you're happy with your workflow</b>, publish it. Then every time a message arrives, the workflow will execute. These executions will show up in the <a data-key='executions'>executions list</a>, but not in the editor.",
+          "<b>While building your workflow</b>, click the 'execute step' button, then publish a message to a TheMQ queue. This will trigger an execution, which will show up in this editor.<br /> <br /><b>Once you're happy with your workflow</b>, publish it. Then every time a message arrives, the workflow will execute. These executions will show up in the <a data-key='executions'>executions list</a>, but not in the editor.",
         active:
-          "<b>While building your workflow</b>, click the 'execute step' button, then publish a message to the TheMQ queue. This will trigger an execution, which will show up in this editor.<br /> <br /><b>Your workflow will also execute automatically</b>, since it's activated. Every time a message arrives, this node will trigger an execution. These executions will show up in the <a data-key='executions'>executions list</a>, but not in the editor.",
+          "<b>While building your workflow</b>, click the 'execute step' button, then publish a message to a TheMQ queue. This will trigger an execution, which will show up in this editor.<br /> <br /><b>Your workflow will also execute automatically</b>, since it's activated. Every time a message arrives, this node will trigger an execution. These executions will show up in the <a data-key='executions'>executions list</a>, but not in the editor.",
       },
       activationHint:
         "Once you've finished building your workflow, publish it to have it also listen continuously (you just won't see those executions here).",
@@ -151,7 +179,7 @@ export class TheMqTrigger implements INodeType {
                 name: "Specified Later in Workflow",
                 value: "laterMessageNode",
                 description:
-                  "Using an TheMQ node to acknowledge the message. If the run ends without one, success acknowledges and failure returns the message.",
+                  "Using a TheMQ node to acknowledge the message. If the run ends without one, success acknowledges and failure returns the message.",
               },
             ],
             default: "immediately",
@@ -174,15 +202,14 @@ export class TheMqTrigger implements INodeType {
             displayName: "Max Processing Time (Ms)",
             name: "visibilityTimeoutMs",
             type: "number",
-            default: 60000,
-            description:
-              "Lease per message in milliseconds (100 to 43200000). Each message must be acknowledged within this time or it is handed out again and may run twice. Set it above your longest run.",
+            default: LEASE_DEFAULT_MS,
+            description: `Lease per message in milliseconds (${LEASE_MIN_MS} to ${LEASE_MAX_MS}). Each message must be acknowledged within this time or it is handed out again and may run twice. Set it above your longest run.`,
           },
         ],
       },
       {
         displayName:
-          "To acknowledge the message, insert an TheMQ node later in the workflow and use the 'Acknowledge' operation",
+          "To acknowledge the message, insert a TheMQ node later in the workflow and use the 'Acknowledge' operation",
         name: "laterMessageNode",
         type: "notice",
         displayOptions: {
@@ -208,18 +235,18 @@ export class TheMqTrigger implements INodeType {
           "Max Concurrent Executions must be an integer greater than zero.",
         );
       }
-      if (maxConcurrent > 1000) {
+      if (maxConcurrent > MAX_CONCURRENT_CAP) {
         throw new NodeOperationError(
           this.getNode(),
           "Max Concurrent Executions must be at most 1000.",
         );
       }
     }
-    const visibilityTimeoutMs = options.visibilityTimeoutMs ?? 60000;
+    const visibilityTimeoutMs = options.visibilityTimeoutMs ?? LEASE_DEFAULT_MS;
     if (
       !Number.isInteger(visibilityTimeoutMs) ||
-      visibilityTimeoutMs < 100 ||
-      visibilityTimeoutMs > 43_200_000
+      visibilityTimeoutMs < LEASE_MIN_MS ||
+      visibilityTimeoutMs > LEASE_MAX_MS
     ) {
       throw new NodeOperationError(
         this.getNode(),
@@ -229,10 +256,10 @@ export class TheMqTrigger implements INodeType {
     // Consumer identity is server-generated, so workflows never share a
     // lease by accident. Immediately is uncapped (server maximum);
     // otherwise the broker leases at most Max Concurrent Executions.
-    const prefetch = acknowledgeMode === "immediately" ? 1000 : maxConcurrent;
+    const prefetch = acknowledgeMode === "immediately" ? IMMEDIATE_PREFETCH : maxConcurrent;
 
     const credentials = (await this.getCredentials("theMqApi")) as unknown as TheMqCredentials;
-    const baseUrl = (credentials.baseUrl ?? "").replace(/\/+$/, "");
+    const baseUrl = normalizeBaseUrl(credentials.baseUrl ?? "");
     const apiToken = credentials.apiToken ?? "";
     const wsUrl = `${baseUrl.replace(/^http/, "ws")}/queues/${encodeURIComponent(queue)}/subscribe`;
 
@@ -254,7 +281,7 @@ export class TheMqTrigger implements INodeType {
 
     const inflight = new Set<string>();
     const pendingSettles = new Map<string, { resolve: () => void; reject: (err: Error) => void }>();
-    let closeGotCalled = false;
+    let closeRequested = false;
     let socket: WebSocket | undefined;
     let activeConsumerId = "";
 
@@ -262,7 +289,7 @@ export class TheMqTrigger implements INodeType {
       const workflow = this.getWorkflow();
       const node = this.getNode();
       this.logger.error(
-        `There was a problem with the TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
+        `There was a problem with TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
         { node: node.name, workflowId: workflow.id },
       );
     };
@@ -279,7 +306,7 @@ export class TheMqTrigger implements INodeType {
               `Timed out connecting to TheMQ for queue "${queue}". Check that TheMQ is running and the Base URL in your credential is correct.`,
             ),
           );
-        }, 15000);
+        }, CONNECT_TIMEOUT_MS);
         candidate.once("open", () => {
           clearTimeout(timer);
           resolve(candidate);
@@ -296,18 +323,18 @@ export class TheMqTrigger implements INodeType {
         const timer = setTimeout(() => {
           cleanup();
           try {
-            candidate.close(1000, "Hello reply timed out");
+            candidate.close(WS_NORMAL_CLOSE, "Hello reply timed out");
           } catch {
             // ignore — socket is already gone
           }
           reject(
             new Error(
-              `Timed out waiting for the TheMQ hello reply for queue "${queue}" (${wsUrl}). ` +
+              `Timed out waiting for a TheMQ hello reply for queue "${queue}" (${wsUrl}). ` +
                 "Is TheMQ 3.0.0+ running and reachable from n8n, and is Redis healthy? " +
-                "Check the TheMQ logs for subscribe/Redis errors.",
+                "Check TheMQ logs for subscribe/Redis errors.",
             ),
           );
-        }, 15000);
+        }, HELLO_TIMEOUT_MS);
         // Deliveries can arrive BEFORE the ready frame — buffer them for
         // replay once the consumer id is known, so none is ever dropped.
         const early: DeliveredMessage[] = [];
@@ -327,13 +354,8 @@ export class TheMqTrigger implements INodeType {
             cleanup();
             resolve({ consumerId: frame["consumerId"], early });
           } else if (frame["type"] === "message" && typeof frame["id"] === "string") {
-            early.push({
-              id: frame["id"],
-              data: frame["data"],
-              deliveryCount:
-                typeof frame["deliveryCount"] === "number" ? frame["deliveryCount"] : 1,
-              redelivered: frame["redelivered"] === true,
-            });
+            const delivered = parseDeliveredMessage(frame);
+            if (delivered) early.push(delivered);
           } else if (frame["type"] === "error") {
             cleanup();
             const code = frameString(frame["code"]) || "ERROR";
@@ -350,7 +372,7 @@ export class TheMqTrigger implements INodeType {
       });
     };
 
-    /** Acknowledge/reject over the persistent connection. */
+    /** Acknowledge/requeue over the persistent connection. */
     const sendSettle = (action: "ack" | "requeue", id: string): Promise<void> => {
       return new Promise<void>((resolve, reject) => {
         const current = socket;
@@ -361,7 +383,7 @@ export class TheMqTrigger implements INodeType {
         const timer = setTimeout(() => {
           pendingSettles.delete(id);
           reject(new Error("Timed out settling the TheMQ message"));
-        }, 10000);
+        }, SETTLE_TIMEOUT_MS);
         pendingSettles.set(id, {
           resolve: () => {
             clearTimeout(timer);
@@ -426,7 +448,7 @@ export class TheMqTrigger implements INodeType {
     });
 
     const handleMessage = async (message: DeliveredMessage): Promise<void> => {
-      if (closeGotCalled) return;
+      if (closeRequested) return;
       inflight.add(message.id);
       try {
         const item = toItem(message);
@@ -442,7 +464,6 @@ export class TheMqTrigger implements INodeType {
           // no TheMQ node fires first.
           const responsePromise = this.helpers.createDeferredPromise<IRun>();
           this.emit([[item]], responsePromiseHook, responsePromise);
-          type RaceResult = { kind: "hook"; real: boolean } | { kind: "run"; data: IRun };
           const first = await Promise.race<RaceResult>([
             responsePromiseHook.promise.then((data): RaceResult => ({
               kind: "hook",
@@ -490,12 +511,8 @@ export class TheMqTrigger implements INodeType {
         return;
       }
       if (frame["type"] === "message" && typeof frame["id"] === "string") {
-        void handleMessage({
-          id: frame["id"],
-          data: frame["data"],
-          deliveryCount: typeof frame["deliveryCount"] === "number" ? frame["deliveryCount"] : 1,
-          redelivered: frame["redelivered"] === true,
-        });
+        const delivered = parseDeliveredMessage(frame);
+        if (delivered) void handleMessage(delivered);
         return;
       }
       if (frame["type"] === "acked" || frame["type"] === "requeued" || frame["type"] === "error") {
@@ -509,12 +526,12 @@ export class TheMqTrigger implements INodeType {
     };
 
     const closeFunction = async (): Promise<void> => {
-      closeGotCalled = true;
+      closeRequested = true;
       // Bounded grace period for in-flight executions; leftovers requeue
       // server-side on close.
       let waits = 0;
-      while (inflight.size > 0 && waits++ < 60) {
-        await sleep(1000);
+      while (inflight.size > 0 && waits++ < CLOSE_WAIT_MAX_ROUNDS) {
+        await sleep(CLOSE_WAIT_INTERVAL_MS);
       }
       for (const [, pending] of pendingSettles) {
         pending.reject(new Error("TheMQ Trigger is closing"));
@@ -524,13 +541,13 @@ export class TheMqTrigger implements INodeType {
       socket = undefined;
       if (current) {
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, 5000);
+          const timer = setTimeout(resolve, CLOSE_GRACE_MS);
           current.once("close", () => {
             clearTimeout(timer);
             resolve();
           });
           try {
-            current.close(1000, "Trigger deactivated");
+            current.close(WS_NORMAL_CLOSE, "Trigger deactivated");
           } catch {
             clearTimeout(timer);
             resolve();
@@ -566,7 +583,7 @@ export class TheMqTrigger implements INodeType {
           pending.reject(new Error("TheMQ connection closed"));
         }
         pendingSettles.clear();
-        if (!closeGotCalled) {
+        if (!closeRequested) {
           this.emitError(new Error(`TheMQ connection closed unexpectedly (code ${String(code)})`));
         }
       });
@@ -578,7 +595,7 @@ export class TheMqTrigger implements INodeType {
         // Catch one message for the editor test run, then disconnect.
         // No execution hooks here: the test run settles it immediately.
         // Hello uses prefetch 1, so at most one message can arrive early.
-        const early = await connectConsumer(1, false);
+        const early = await connectConsumer(MANUAL_PREFETCH, false);
         const first =
           early.length > 0
             ? early[0]
@@ -596,14 +613,11 @@ export class TheMqTrigger implements INodeType {
                     return;
                   }
                   if (frame["type"] === "message" && typeof frame["id"] === "string") {
-                    current.off("message", onFrame);
-                    resolve({
-                      id: frame["id"],
-                      data: frame["data"],
-                      deliveryCount:
-                        typeof frame["deliveryCount"] === "number" ? frame["deliveryCount"] : 1,
-                      redelivered: frame["redelivered"] === true,
-                    });
+                    const delivered = parseDeliveredMessage(frame);
+                    if (delivered) {
+                      current.off("message", onFrame);
+                      resolve(delivered);
+                    }
                   }
                 };
                 current.on("message", onFrame);

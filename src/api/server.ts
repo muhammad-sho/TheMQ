@@ -35,6 +35,10 @@ export type AppInstance = FastifyInstance<
 /** Health probes stay unauthenticated so orchestrators can check them. */
 const PUBLIC_PATHS = new Set(["/health/live", "/health/ready"]);
 
+/** Default request ceiling: 1000 requests per rolling minute per client. */
+const RATE_LIMIT_MAX = 1000;
+const RATE_LIMIT_WINDOW = "1 minute";
+
 function isAuthorized(
   request: { url: string; headers: Record<string, string | string[] | undefined> },
   config: AppConfig,
@@ -58,7 +62,7 @@ export async function buildApp(services: ApiServices): Promise<AppInstance> {
   const app = fastify({ loggerInstance: logger, forceCloseConnections: true });
 
   await app.register(helmet);
-  await app.register(rateLimit, { max: 1000, timeWindow: "1 minute" });
+  await app.register(rateLimit, { max: RATE_LIMIT_MAX, timeWindow: RATE_LIMIT_WINDOW });
   await app.register(websocket);
 
   app.addHook("onRequest", async (request, reply) => {

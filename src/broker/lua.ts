@@ -51,9 +51,13 @@ return 1
  * Publish one message, or upsert it when the id already exists (new data
  * and TTL as if freshly published; deliveries reset; createdAt kept).
  * Leased messages are never overwritten: {'LEASED'}.
+ * With onConflict=skip, an existing id (leased or not) is left untouched
+ * and reported instead: {'SKIPPED', state, availableAt, createdAt,
+ * deliveries}. No counters move and no lease changes.
  * KEYS: registry, meta, ready, delayed, msg
- * ARGV: queue, id, dataJson, availableAt, now, upsert
- * Returns {'OK', state, upserted, createdAt} | {'CONFLICT'} | {'LEASED'}.
+ * ARGV: queue, id, dataJson, availableAt, now, upsert, onConflict
+ * Returns {'OK', state, upserted, createdAt} | {'CONFLICT'} | {'LEASED'} |
+ * {'SKIPPED', state, availableAt, createdAt, deliveries}.
  */
 export const PUBLISH_SCRIPT = `
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
@@ -62,14 +66,24 @@ end
 if redis.call('EXISTS', KEYS[2]) == 0 then
   redis.call('HSET', KEYS[2], 'createdAt', ARGV[5], 'published', 0, 'delivered', 0, 'acked', 0, 'requeued', 0, 'deleted', 0, 'updated', 0)
 end
+local function skipped()
+  local info = redis.call('HMGET', KEYS[5], 'state', 'availableAt', 'createdAt', 'deliveries')
+  return {'SKIPPED', info[1], info[2], info[3], info[4]}
+end
 local exists = redis.call('EXISTS', KEYS[5])
 local upserted = 0
 if exists == 1 then
   if ARGV[6] ~= '1' then
+    if ARGV[7] == 'skip' then
+      return skipped()
+    end
     return {'CONFLICT'}
   end
   local current = redis.call('HGET', KEYS[5], 'state')
   if current == 'unacked' then
+    if ARGV[7] == 'skip' then
+      return skipped()
+    end
     return {'LEASED'}
   end
   upserted = 1

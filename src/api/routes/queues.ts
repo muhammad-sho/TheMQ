@@ -1,7 +1,6 @@
-import type { AppInstance } from "../server.js";
+import type { AppInstance, ApiServices } from "../server.js";
 import { parseWith } from "./helpers.js";
 import { queueParamsSchema } from "../schemas/common.js";
-import type { ApiServices } from "../server.js";
 
 export function registerQueueRoutes(app: AppInstance, services: ApiServices): void {
   const { broker } = services;

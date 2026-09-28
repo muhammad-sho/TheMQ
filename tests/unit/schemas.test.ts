@@ -27,6 +27,18 @@ describe("broker schemas", () => {
     expect(publishMessageSchema.safeParse({ data: {}, ttlMs: -1 }).success).toBe(false);
   });
 
+  it("defaults onConflict to error and only accepts error or skip", () => {
+    const parsed = publishMessageSchema.safeParse({ id: "msg_1", data: {} });
+    expect(parsed.success).toBe(true);
+    if (parsed.success) expect(parsed.data.onConflict).toBe("error");
+    expect(
+      publishMessageSchema.safeParse({ id: "msg_1", data: {}, onConflict: "skip" }).success,
+    ).toBe(true);
+    expect(
+      publishMessageSchema.safeParse({ id: "msg_1", data: {}, onConflict: "replace" }).success,
+    ).toBe(false);
+  });
+
   it("accepts consume options within bounds", () => {
     const parsed = consumeSchema.safeParse({
       consumerId: "worker-1",

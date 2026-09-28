@@ -90,10 +90,16 @@ export class RedisConnectionManager {
     }
   }
 
-  async closeAll(): Promise<void> {
+  /** Detach every tracked client and reset shared state. Shared by both shutdown paths. */
+  private takeClients(): Redis[] {
     const clients = [...this.clients];
     this.clients.clear();
     this.shared = undefined;
+    return clients;
+  }
+
+  async closeAll(): Promise<void> {
+    const clients = this.takeClients();
     await Promise.all(
       clients.map(async (client) => {
         try {
@@ -116,10 +122,7 @@ export class RedisConnectionManager {
    * exists; it prevents ioredis reconnect timers from keeping the process up.
    */
   disconnectAll(): void {
-    const clients = [...this.clients];
-    this.clients.clear();
-    this.shared = undefined;
-    for (const client of clients) {
+    for (const client of this.takeClients()) {
       try {
         client.disconnect();
       } catch {

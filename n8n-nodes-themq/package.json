@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-themq",
-  "version": "0.4.4",
+  "version": "0.5.0",
   "description": "Native n8n community nodes for TheMQ — a lightweight, Redis-backed queue/consumer message broker.",
   "keywords": [
     "n8n-community-node-package",
@@ -22,7 +22,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json && npm run copy:icons",
-    "copy:icons": "cp nodes/TheMq/themq.png dist/nodes/TheMq/themq.png && cp nodes/TheMqTrigger/themq.png dist/nodes/TheMqTrigger/themq.png",
+    "copy:icons": "mkdir -p dist/nodes/TheMq dist/nodes/TheMqTrigger && cp nodes/TheMq/themq.png dist/nodes/TheMq/themq.png && cp nodes/TheMqTrigger/themq.png dist/nodes/TheMqTrigger/themq.png",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint credentials nodes index.ts",
     "format": "prettier --write .",
@@ -43,10 +43,10 @@
     ]
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.6.3",
     "@types/ws": "^8.18.1",
     "eslint": "^9.18.0",
-    "n8n-workflow": "^1.0.0",
+    "n8n-workflow": "^2.16.0",
     "prettier": "^3.4.0",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.20.0"
