@@ -5,7 +5,8 @@ COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
-RUN npm run build
+# Runtime needs plain JS only: skip declarations and sourcemaps.
+RUN npm run build:docker
 
 # ---- Runtime stage ----
 FROM node:22-alpine AS runtime
@@ -15,7 +16,8 @@ ENV NODE_ENV=production
 ENV REDIS_URL=redis://redis:6379
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev && npm cache clean --force
+# Prod dependencies only; the lockfile is build input, not runtime cargo.
+RUN npm ci --omit=dev && npm cache clean --force && rm package-lock.json
 COPY --from=build /app/dist ./dist
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \

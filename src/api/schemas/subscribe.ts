@@ -4,8 +4,8 @@ import { consumerIdSchema } from "./common.js";
 
 /**
  * First frame a persistent consumer must send after connecting.
- * Flow control stays server-side: `prefetch` caps leased messages,
- * `visibilityTimeoutMs` is the per-message lease.
+ * `prefetch` caps leased messages server-side; `visibilityTimeoutMs`
+ * is accepted for backward compatibility but sets no expiry.
  */
 export const helloSchema = z
   .object({

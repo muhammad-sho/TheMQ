@@ -39,6 +39,8 @@ export const configSchema = z.object({
   apiPort: z.number().int().min(0).max(65535),
   apiToken: z.string().min(1).optional(),
   authDisabled: z.boolean(),
+  /** Requests per rolling minute per client IP (shared by HTTP + WS upgrade). */
+  rateLimitMaxPerMinute: z.number().int().min(1),
   defaultVisibilityTimeoutMs: z.number().int().min(LEASE_TIMEOUT_MIN_MS).max(LEASE_TIMEOUT_MAX_MS),
   defaultPrefetch: z.number().int().min(1).max(PREFETCH_MAX),
   maxConsumeCount: z.number().int().min(1).max(CONSUME_COUNT_MAX),

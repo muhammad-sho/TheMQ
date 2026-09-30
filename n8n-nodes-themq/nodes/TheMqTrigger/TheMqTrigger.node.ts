@@ -66,7 +66,6 @@ function frameString(value: unknown): string {
   return typeof value === "string" ? value : "";
 }
 
-/** Decode a WebSocket frame payload to text. */
 function frameText(raw: WebSocket.RawData): string {
   if (typeof raw === "string") return raw;
   if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");

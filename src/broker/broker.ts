@@ -112,7 +112,6 @@ function isMessageState(value: unknown): value is MessageState {
   return value === "ready" || value === "delayed" || value === "unacked";
 }
 
-/** Flatten a Lua array reply into strings (nested tables stay nested). */
 function asArray(reply: unknown, script: string): unknown[] {
   if (!Array.isArray(reply)) {
     throw ApiError.internal(`Unexpected reply from ${script}.`);

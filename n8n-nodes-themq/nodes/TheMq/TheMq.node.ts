@@ -81,7 +81,6 @@ export class TheMq implements INodeType {
         displayName: "Queue",
         name: "queue",
         type: "string",
-        // Taken from the trigger item when connected.
         default: "={{ $json.queue }}",
         required: true,
         description: "Name of the queue (taken from the trigger item when connected)",
@@ -90,7 +89,6 @@ export class TheMq implements INodeType {
         displayName: "Message ID",
         name: "messageId",
         type: "string",
-        // Taken from the trigger item when connected.
         default: "={{ $json.messageId }}",
         required: true,
         description:
@@ -150,7 +148,6 @@ export class TheMq implements INodeType {
         displayName: "Consumer ID",
         name: "consumerId",
         type: "string",
-        // Taken from the trigger item when connected.
         default: "={{ $json.consumerId }}",
         displayOptions: { show: { operation: ["ack"] } },
         description:
@@ -315,7 +312,7 @@ function hintForCode(code: string, operation: string, message: string): string {
         return "A message with this ID already exists. Enable Upsert to update it, or set On Conflict to Skip.";
       }
       if (operation === "ack") {
-        return "The message is not leased to this consumer. It may already be settled, expired, or held by another consumer — check the Consumer ID.";
+        return "The message is not leased to this consumer. It may already be settled or held by another consumer — check the Consumer ID.";
       }
       return "The message is leased (unacked). Acknowledge it first.";
     case "SERVICE_UNAVAILABLE":

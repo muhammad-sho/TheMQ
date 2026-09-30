@@ -1,5 +1,6 @@
 import type * as WebSocket from "ws";
 import { ApiError } from "../errors.js";
+import { frameToString } from "../frames.js";
 import type { OutgoingMessage, SubscriberHandle } from "../../broker/subscriptions.js";
 import { queueParamsSchema } from "../schemas/common.js";
 import { helloSchema } from "../schemas/subscribe.js";
@@ -24,14 +25,6 @@ interface ServerFrame {
 
 function sendFrame(socket: WebSocket.WebSocket, frame: ServerFrame): void {
   socket.send(JSON.stringify(frame));
-}
-
-/** Decode a WebSocket frame payload to text. */
-function rawToString(raw: WebSocket.RawData): string {
-  if (typeof raw === "string") return raw;
-  if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");
-  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString("utf8");
-  return raw.toString("utf8");
 }
 
 function errorFrame(code: string, message: string, id?: string): ServerFrame {
@@ -168,7 +161,7 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
     async function onClientFrame(raw: WebSocket.RawData): Promise<void> {
       let frame: unknown;
       try {
-        frame = JSON.parse(rawToString(raw)) as unknown;
+        frame = JSON.parse(frameToString(raw)) as unknown;
       } catch {
         sendFrame(socket, errorFrame("PROTOCOL_ERROR", "Frame must be JSON."));
         return;
@@ -200,7 +193,9 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
           queue,
           consumerId,
           prefetch: input.prefetch ?? config.defaultPrefetch,
-          visibilityTimeoutMs: input.visibilityTimeoutMs ?? config.defaultVisibilityTimeoutMs,
+          // Echoed for wire compatibility only; persistent deliveries
+          // carry no deadline.
+          visibilityTimeoutMs: config.defaultVisibilityTimeoutMs,
         });
         logger.info({ event: "subscribed", queue, consumer: consumerId }, "Consumer connected");
         heartbeatTimer = setInterval(() => {
@@ -234,14 +229,12 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
     async function subscribeOrFail(input: {
       consumerId?: string;
       prefetch?: number;
-      visibilityTimeoutMs?: number;
     }): Promise<SubscriberHandle | undefined> {
       try {
         return await subscriptions.add({
           queue,
           ...(input.consumerId !== undefined ? { consumerId: input.consumerId } : {}),
           prefetch: input.prefetch ?? config.defaultPrefetch,
-          visibilityTimeoutMs: input.visibilityTimeoutMs ?? config.defaultVisibilityTimeoutMs,
           send: (message: OutgoingMessage) => {
             sendFrame(socket, { type: "message", ...message });
           },
@@ -264,7 +257,7 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
 
     function parseHello(
       record: Record<string, unknown>,
-    ): { consumerId?: string; prefetch?: number; visibilityTimeoutMs?: number } | undefined {
+    ): { consumerId?: string; prefetch?: number } | undefined {
       const result = helloSchema.safeParse(record);
       if (!result.success) {
         sendFrame(
@@ -273,12 +266,11 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
         );
         return undefined;
       }
+      // visibilityTimeoutMs validates but is ignored: persistent
+      // deliveries carry no deadline.
       return {
         ...(result.data.consumerId !== undefined ? { consumerId: result.data.consumerId } : {}),
         ...(result.data.prefetch !== undefined ? { prefetch: result.data.prefetch } : {}),
-        ...(result.data.visibilityTimeoutMs !== undefined
-          ? { visibilityTimeoutMs: result.data.visibilityTimeoutMs }
-          : {}),
       };
     }
 

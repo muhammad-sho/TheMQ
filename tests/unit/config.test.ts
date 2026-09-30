@@ -12,6 +12,7 @@ describe("loadConfig", () => {
     expect(config.apiPort).toBe(3000);
     expect(config.apiToken).toBeUndefined();
     expect(config.authDisabled).toBe(false);
+    expect(config.rateLimitMaxPerMinute).toBe(1000);
     expect(config.defaultVisibilityTimeoutMs).toBe(30_000);
     expect(config.defaultPrefetch).toBe(100);
     expect(config.maxConsumeCount).toBe(100);
@@ -31,6 +32,7 @@ describe("loadConfig", () => {
       API_PORT: "4000",
       API_TOKEN: "secret",
       AUTH_DISABLED: "true",
+      RATE_LIMIT_MAX_PER_MINUTE: "5000",
       DEFAULT_VISIBILITY_TIMEOUT_MS: "5000",
       DEFAULT_PREFETCH: "5",
       MAX_CONSUME_COUNT: "10",
@@ -45,6 +47,7 @@ describe("loadConfig", () => {
     expect(config.apiPort).toBe(4000);
     expect(config.apiToken).toBe("secret");
     expect(config.authDisabled).toBe(true);
+    expect(config.rateLimitMaxPerMinute).toBe(5000);
     expect(config.defaultVisibilityTimeoutMs).toBe(5000);
     expect(config.defaultPrefetch).toBe(5);
     expect(config.maxConsumeCount).toBe(10);
@@ -63,6 +66,7 @@ describe("loadConfig", () => {
     expect(() => loadConfig({ LOG_LEVEL: "verbose" })).toThrow(/Invalid configuration/);
     expect(() => loadConfig({ DEFAULT_PREFETCH: "0" })).toThrow(/Invalid configuration/);
     expect(() => loadConfig({ AUTH_DISABLED: "maybe" })).toThrow(/Invalid configuration/);
+    expect(() => loadConfig({ RATE_LIMIT_MAX_PER_MINUTE: "0" })).toThrow(/Invalid configuration/);
     expect(() => loadConfig({ REDIS_TUNING: "maybe" })).toThrow(/Invalid configuration/);
     expect(() => loadConfig({ REDIS_MAXMEMORY_MB: "8" })).toThrow(/Invalid configuration/);
   });

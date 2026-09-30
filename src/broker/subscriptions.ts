@@ -16,12 +16,6 @@ export interface SubscriberOptions {
   consumerId?: string | undefined;
   /** Max messages leased to this consumer at once (server-enforced). */
   prefetch: number;
-  /**
-   * Accepted for backward compatibility with older hellos; persistent
-   * deliveries are held without a deadline (RabbitMQ manual-ack style),
-   * so this no longer sets an expiry.
-   */
-  visibilityTimeoutMs: number;
   /** Called once per delivered message; throwing marks the subscriber broken. */
   send: (message: OutgoingMessage) => void;
 }
@@ -39,7 +33,6 @@ export interface SubscriberHandle {
 
 interface Subscriber extends SubscriberHandle {
   prefetch: number;
-  visibilityTimeoutMs: number;
   send: (message: OutgoingMessage) => void;
 }
 
@@ -89,7 +82,6 @@ export class SubscriptionManager {
       consumerId,
       token: nextToken++,
       prefetch: options.prefetch,
-      visibilityTimeoutMs: options.visibilityTimeoutMs,
       send: options.send,
     };
     let byConsumer = this.subscribers.get(options.queue);

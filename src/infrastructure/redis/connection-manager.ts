@@ -54,11 +54,18 @@ export class RedisConnectionManager {
   /**
    * Minimal options (not typed as ioredis' RedisOptions: that type is not
    * assignable to the constructor overloads under exactOptionalPropertyTypes).
+   * Auto-pipelining batches concurrent commands per tick — the main
+   * throughput lever under parallel load; scripts stay atomic.
    */
-  private buildOptions(): { maxRetriesPerRequest: null; enableOfflineQueue: false } {
+  private buildOptions(): {
+    maxRetriesPerRequest: null;
+    enableOfflineQueue: false;
+    enableAutoPipelining: true;
+  } {
     return {
       maxRetriesPerRequest: null,
       enableOfflineQueue: false,
+      enableAutoPipelining: true,
     };
   }
 

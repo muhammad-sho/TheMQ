@@ -2,19 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocket } from "ws";
 import type { BuiltSystem } from "../../src/app/build-app.js";
 import { buildSystem } from "../../src/app/build-app.js";
+import { frameToString } from "../../src/api/frames.js";
 import { testConfig, uniquePrefix } from "./helpers.js";
 
 interface ServerFrame {
   type: string;
   [key: string]: unknown;
-}
-
-/** Decode a WebSocket frame payload to text. */
-function frameText(raw: WebSocket.RawData): string {
-  if (typeof raw === "string") return raw;
-  if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");
-  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString("utf8");
-  return raw.toString("utf8");
 }
 
 function portOf(system: BuiltSystem): number {
@@ -43,7 +36,7 @@ function openConsumer(
     timer: ReturnType<typeof setTimeout>;
   }> = [];
   ws.on("message", (raw) => {
-    const frame = JSON.parse(frameText(raw)) as ServerFrame;
+    const frame = JSON.parse(frameToString(raw)) as ServerFrame;
     const waiter = waiters.shift();
     if (waiter) {
       clearTimeout(waiter.timer);

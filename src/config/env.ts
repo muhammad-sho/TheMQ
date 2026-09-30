@@ -39,6 +39,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       apiPort: parseNumberString(env["API_PORT"], 3000, "API_PORT"),
       apiToken: parseOptionalString(env["API_TOKEN"]),
       authDisabled: parseBooleanString(env["AUTH_DISABLED"], false),
+      rateLimitMaxPerMinute: parseNumberString(
+        env["RATE_LIMIT_MAX_PER_MINUTE"],
+        1000,
+        "RATE_LIMIT_MAX_PER_MINUTE",
+      ),
       defaultVisibilityTimeoutMs: parseNumberString(
         env["DEFAULT_VISIBILITY_TIMEOUT_MS"],
         30_000,

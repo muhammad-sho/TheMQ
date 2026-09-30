@@ -26,7 +26,7 @@ export interface ApiErrorBody {
 
 /**
  * Stable API error. Services throw these; the Fastify handler translates
- * them to HTTP. Raw backend errors never reach the public contract.
+ * them to HTTP.
  */
 export class ApiError extends Error {
   readonly code: TheMQErrorCode;
@@ -83,10 +83,7 @@ export class ApiError extends Error {
   }
 }
 
-/**
- * Error names that always mean "the backend could not be reached".
- * Matched by name so callers never depend on deep ioredis import paths.
- */
+/** Error names that mean the backend could not be reached. */
 const CONNECTION_ERROR_NAMES = new Set([
   "MaxRetriesPerRequestError",
   "ConnectionClosedError",
@@ -94,7 +91,7 @@ const CONNECTION_ERROR_NAMES = new Set([
   "ConnectionNotReadyError",
 ]);
 
-/** Node.js syscall codes that always mean "the backend could not be reached". */
+/** Node.js syscall codes that mean the backend could not be reached. */
 const CONNECTION_ERROR_CODES = new Set([
   "ECONNREFUSED",
   "ENOTFOUND",
@@ -106,7 +103,7 @@ const CONNECTION_ERROR_CODES = new Set([
   "EHOSTUNREACH",
 ]);
 
-/** Message fragments (backend wording) that mean "the backend is down". */
+/** Backend message fragments that mean the backend is down. */
 const CONNECTION_MESSAGE_PATTERNS = [
   /connection is closed/i,
   /connection lost/i,
@@ -131,8 +128,7 @@ export function isConnectionError(err: unknown): boolean {
 
 /**
  * Map a backend failure to a stable API error: unreachable -> 503,
- * anything else -> 500. ApiErrors pass through; the original stays as
- * `cause` for logs and never reaches the public message.
+ * anything else -> 500. The original stays as `cause` for logs.
  */
 export function classifyBackendError(err: unknown, operation: string): ApiError {
   if (err instanceof ApiError) return err;

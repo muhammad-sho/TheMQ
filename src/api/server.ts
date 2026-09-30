@@ -35,8 +35,7 @@ export type AppInstance = FastifyInstance<
 /** Health probes stay unauthenticated so orchestrators can check them. */
 const PUBLIC_PATHS = new Set(["/health/live", "/health/ready"]);
 
-/** Default request ceiling: 1000 requests per rolling minute per client. */
-const RATE_LIMIT_MAX = 1000;
+/** Rolling window for the per-client request ceiling (see RATE_LIMIT_MAX_PER_MINUTE). */
 const RATE_LIMIT_WINDOW = "1 minute";
 
 function isAuthorized(
@@ -55,14 +54,24 @@ function isAuthorized(
   return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
-/** Build the Fastify app. Routes are thin: Zod validates, the broker decides. */
 export async function buildApp(services: ApiServices): Promise<AppInstance> {
   const { config, logger } = services;
-  // Ensure server keep-alive sockets cannot outlive a shutdown request.
-  const app = fastify({ loggerInstance: logger, forceCloseConnections: true });
+  // Keep-alive sockets cannot outlive a shutdown request; the body cap
+  // follows MAX_MESSAGE_BYTES so the setting holds end to end.
+  const app = fastify({
+    loggerInstance: logger,
+    forceCloseConnections: true,
+    bodyLimit: config.maxMessageBytes,
+    // No per-request access logs: at thousands of rps they cost ~35%
+    // throughput and flood disks. Errors and lifecycle events still log.
+    disableRequestLogging: true,
+  });
 
   await app.register(helmet);
-  await app.register(rateLimit, { max: RATE_LIMIT_MAX, timeWindow: RATE_LIMIT_WINDOW });
+  await app.register(rateLimit, {
+    max: config.rateLimitMaxPerMinute,
+    timeWindow: RATE_LIMIT_WINDOW,
+  });
   await app.register(websocket);
 
   app.addHook("onRequest", async (request, reply) => {
