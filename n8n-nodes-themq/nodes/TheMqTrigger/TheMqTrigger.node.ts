@@ -18,7 +18,6 @@ type AcknowledgeMode =
 interface TriggerOptions {
   acknowledge?: AcknowledgeMode;
   maxConcurrentExecutions?: number;
-  visibilityTimeoutMs?: number;
 }
 
 interface TheMqCredentials {
@@ -41,10 +40,7 @@ interface ReadyInfo {
 
 type RaceResult = { kind: "hook"; real: boolean } | { kind: "run"; data: IRun };
 
-/** Bounds mirror the server contract (100ms – 12h lease). */
-const LEASE_MIN_MS = 100;
-const LEASE_MAX_MS = 43_200_000;
-const LEASE_DEFAULT_MS = 60_000;
+/** Bounds mirror the server contract (prefetch cap). */
 const MAX_CONCURRENT_CAP = 1000;
 const IMMEDIATE_PREFETCH = 1000;
 const MANUAL_PREFETCH = 1;
@@ -161,29 +157,29 @@ export class TheMqTrigger implements INodeType {
                 name: "Execution Finishes",
                 value: "executionFinishes",
                 description:
-                  "After the workflow execution finished. The message is acknowledged whether the execution was successful or not.",
+                  "After the workflow execution finished, however long it takes. The message is held (never redelivered) until then, and acknowledged whether the execution was successful or not.",
               },
               {
                 name: "Execution Finishes Successfully",
                 value: "executionFinishesSuccessfully",
                 description:
-                  "After the workflow execution finished successfully. On failure the message goes back to the queue and is delivered again.",
+                  "After the workflow execution finished successfully, however long it takes. The message is held (never redelivered) until then. On failure it goes back to the queue and is delivered again.",
               },
               {
                 name: "Immediately",
                 value: "immediately",
                 description:
-                  "As soon as the message arrives, without a concurrency limit. The workflow still runs, but a failure can no longer return the message.",
+                  "As soon as the message arrives, without a concurrency limit (RabbitMQ auto-ack). The workflow still runs, but a failure can no longer return the message.",
               },
               {
                 name: "Specified Later in Workflow",
                 value: "laterMessageNode",
                 description:
-                  "Using a TheMQ node to acknowledge the message. If the run ends without one, success acknowledges and failure returns the message.",
+                  "Using a TheMQ node to acknowledge the message. The message is held without a deadline until then. If the run ends without one, success acknowledges and failure returns the message.",
               },
             ],
             default: "immediately",
-            description: "When to acknowledge the message",
+            description: "When to acknowledge the message (held without a deadline until then)",
           },
           {
             displayName: "Max Concurrent Executions",
@@ -196,14 +192,7 @@ export class TheMqTrigger implements INodeType {
               },
             },
             description:
-              "At most this many messages being processed at the same time. Further messages wait in the queue until one is acknowledged.",
-          },
-          {
-            displayName: "Max Processing Time (Ms)",
-            name: "visibilityTimeoutMs",
-            type: "number",
-            default: LEASE_DEFAULT_MS,
-            description: `Lease per message in milliseconds (${LEASE_MIN_MS} to ${LEASE_MAX_MS}). Each message must be acknowledged within this time or it is handed out again and may run twice. Set it above your longest run.`,
+              "At most this many messages being processed at the same time (RabbitMQ prefetch). Further messages wait in the queue until one is acknowledged.",
           },
         ],
       },
@@ -242,20 +231,12 @@ export class TheMqTrigger implements INodeType {
         );
       }
     }
-    const visibilityTimeoutMs = options.visibilityTimeoutMs ?? LEASE_DEFAULT_MS;
-    if (
-      !Number.isInteger(visibilityTimeoutMs) ||
-      visibilityTimeoutMs < LEASE_MIN_MS ||
-      visibilityTimeoutMs > LEASE_MAX_MS
-    ) {
-      throw new NodeOperationError(
-        this.getNode(),
-        "Max Processing Time must be an integer between 100 and 43200000 milliseconds.",
-      );
-    }
     // Consumer identity is server-generated, so workflows never share a
     // lease by accident. Immediately is uncapped (server maximum);
     // otherwise the broker leases at most Max Concurrent Executions.
+    // Deliveries carry no deadline: the broker holds each message until
+    // it is acked, requeued, or this connection drops (RabbitMQ
+    // manual-ack semantics).
     const prefetch = acknowledgeMode === "immediately" ? IMMEDIATE_PREFETCH : maxConcurrent;
 
     const credentials = (await this.getCredentials("theMqApi")) as unknown as TheMqCredentials;
@@ -566,7 +547,6 @@ export class TheMqTrigger implements INodeType {
         JSON.stringify({
           action: "hello",
           prefetch: helloPrefetch,
-          visibilityTimeoutMs,
         }),
       );
       const ready = await waitReady(candidate);

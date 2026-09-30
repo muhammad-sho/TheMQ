@@ -121,9 +121,13 @@ return {'OK', state, upserted, createdAt}
 /**
  * Consume up to `count` messages. Promotes due delayed messages and
  * reclaims expired leases first.
+ * Leases without a deadline (visibilityMs < 0) are held RabbitMQ-style:
+ * the message stays leased until it is acked, requeued, or its
+ * consumer disconnects — it can never expire.
  * KEYS: registry, meta, ready, delayed, unacked, consumers, pending
- * ARGV: queue, consumer, count, prefetch(-1 = keep), visibilityMs, now,
- *       maxScan, msgPrefix, pendPrefix, defaultPrefetch
+ * ARGV: queue, consumer, count, prefetch(-1 = keep), visibilityMs
+ *       (-1 = no deadline), now, maxScan, msgPrefix, pendPrefix,
+ *       defaultPrefetch
  * Returns {'NOT_FOUND'} | {'OK', delivered, outstanding, id, data, deliveries, ...}.
  */
 export const CONSUME_SCRIPT = `
@@ -133,6 +137,11 @@ end
 local now = tonumber(ARGV[6])
 local scan = tonumber(ARGV[7])
 local vis = tonumber(ARGV[5])
+local noExpiry = vis < 0
+-- Deadline-free leases score +inf so the reclaim scans below
+-- (ZRANGEBYSCORE 0 now) can never match them.
+local deadline = noExpiry and 'inf' or (now + vis)
+local visibleAt = noExpiry and 0 or deadline
 local requestedPrefetch = tonumber(ARGV[4])
 local effPrefetch
 if requestedPrefetch >= 0 then
@@ -186,8 +195,8 @@ for i = 1, allowed do
   if redis.call('EXISTS', m) == 1 and redis.call('HGET', m, 'state') == 'ready' then
     local deliveries = redis.call('HINCRBY', m, 'deliveries', 1)
     redis.call('HSET', m, 'state', 'unacked', 'consumer', ARGV[2],
-      'visibleAt', now + vis, 'updatedAt', now)
-    redis.call('ZADD', KEYS[5], now + vis, id)
+      'visibleAt', visibleAt, 'updatedAt', now)
+    redis.call('ZADD', KEYS[5], deadline, id)
     redis.call('SADD', KEYS[7], id)
     delivered = delivered + 1
     local data = redis.call('HGET', m, 'data')
@@ -345,6 +354,46 @@ end
 if next == '0' then
   redis.call('DEL', KEYS[5])
   redis.call('HDEL', KEYS[4], ARGV[1])
+end
+return {'OK', requeued, next}
+`;
+
+/**
+ * Boot recovery: requeue every leased message of a queue. Only safe when
+ * no consumer can be live (server start) — it drops the whole consumer
+ * registry and all pending sets for the queue.
+ * KEYS: registry, meta, ready, unacked, consumers
+ * ARGV: queue, now, msgPrefix, pendPrefix, cursor, count
+ * Returns {'NOT_FOUND'} | {'OK', requeued, nextCursor}.
+ */
+export const RECOVER_ORPHANS_SCRIPT = `
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
+  return {'NOT_FOUND'}
+end
+local res = redis.call('ZSCAN', KEYS[4], ARGV[5], 'COUNT', tonumber(ARGV[6]))
+local next = res[1]
+local requeued = 0
+for i = 1, #res[2], 2 do
+  local id = res[2][i]
+  redis.call('ZREM', KEYS[4], id)
+  local m = ARGV[3] .. id
+  if redis.call('EXISTS', m) == 1 and redis.call('HGET', m, 'state') == 'unacked' then
+    local owner = redis.call('HGET', m, 'consumer')
+    redis.call('HSET', m, 'state', 'ready', 'consumer', '', 'visibleAt', 0, 'updatedAt', ARGV[2])
+    redis.call('RPUSH', KEYS[3], id)
+    requeued = requeued + 1
+    if owner and owner ~= '' then
+      local pend = ARGV[4] .. owner .. ':pending'
+      redis.call('SREM', pend, id)
+      redis.call('DEL', pend)
+    end
+  end
+end
+if requeued > 0 then
+  redis.call('HINCRBY', KEYS[2], 'requeued', requeued)
+end
+if next == '0' then
+  redis.call('DEL', KEYS[5])
 end
 return {'OK', requeued, next}
 `;

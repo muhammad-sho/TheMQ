@@ -1,6 +1,6 @@
 {
   "name": "themq",
-  "version": "3.1.0",
+  "version": "3.2.0",
   "description": "TheMQ — a lightweight, Redis-backed queue/consumer message broker with message delete and TTL reset.",
   "main": "dist/index.js",
   "type": "module",

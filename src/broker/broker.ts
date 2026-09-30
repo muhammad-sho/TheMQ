@@ -10,6 +10,7 @@ import {
   DELETE_MESSAGE_SCRIPT,
   DELETE_QUEUE_SCRIPT,
   PUBLISH_SCRIPT,
+  RECOVER_ORPHANS_SCRIPT,
   REQUEUE_SCRIPT,
   SET_TTL_SCRIPT,
   STATS_SCRIPT,
@@ -75,6 +76,14 @@ export interface ConsumeOptions {
   visibilityTimeoutMs?: number | undefined;
   /** Max leased messages per consumer (-1/undefined keeps the stored value). */
   prefetch?: number | undefined;
+  /**
+   * Hold deliveries without a visibility deadline (RabbitMQ manual-ack
+   * semantics): the message stays leased until it is acked, requeued, or
+   * its consumer disconnects. Used by persistent (WebSocket) consumers;
+   * connectionless REST reads keep a finite lease so abandoned work still
+   * returns to the queue.
+   */
+  noExpiry?: boolean | undefined;
 }
 
 type ScriptCaller = (...args: Array<string | number>) => Promise<unknown>;
@@ -90,6 +99,8 @@ const DELETE_MAX_ITERS = 200;
 const DELETE_MAX_ATTEMPTS = 5;
 /** Cancel-consumer page bound so a giant consumer set cannot loop forever. */
 const CANCEL_MAX_PAGES = 100;
+/** Orphan-recovery page bound (same shape as consumer cancellation). */
+const RECOVER_MAX_PAGES = 100;
 
 /** Fired when a queue may have messages available (drives push consumers). */
 export type BrokerChangeHandler = (queue: string) => void;
@@ -205,6 +216,7 @@ export class BrokerService {
     this.register("themqDeleteMessage", DELETE_MESSAGE_SCRIPT, 4);
     this.register("themqSetTtl", SET_TTL_SCRIPT, 4);
     this.register("themqCancelConsumer", CANCEL_CONSUMER_SCRIPT, 5);
+    this.register("themqRecoverOrphans", RECOVER_ORPHANS_SCRIPT, 5);
     this.register("themqSweep", SWEEP_SCRIPT, 4);
     this.register("themqStats", STATS_SCRIPT, 6);
   }
@@ -511,16 +523,21 @@ export class BrokerService {
     const keys = queueKeys(this.options.prefix, queue);
     const consumerId = opts.consumerId ?? generateConsumerId();
     const count = Math.min(Math.max(opts.count ?? 1, 1), this.options.maxConsumeCount);
-    // Clamp the lease and never let an invalid prefetch wedge the
-    // stored per-consumer cap at zero.
-    const visibilityMs = Math.min(
-      Math.max(
-        opts.visibilityTimeoutMs ?? this.options.defaultVisibilityTimeoutMs,
-        LEASE_TIMEOUT_MIN_MS,
-      ),
-      LEASE_TIMEOUT_MAX_MS,
-    );
+    // Deadline-free holds skip the lease clamp entirely (-1); finite
+    // leases clamp exactly as before.
+    const noExpiry = opts.noExpiry === true;
+    const visibilityMs = noExpiry
+      ? -1
+      : Math.min(
+          Math.max(
+            opts.visibilityTimeoutMs ?? this.options.defaultVisibilityTimeoutMs,
+            LEASE_TIMEOUT_MIN_MS,
+          ),
+          LEASE_TIMEOUT_MAX_MS,
+        );
     const prefetch =
+      // Never let an invalid prefetch wedge the stored per-consumer cap
+      // at zero (-1 keeps the stored value).
       opts.prefetch === undefined || opts.prefetch < 1 ? -1 : Math.min(opts.prefetch, PREFETCH_MAX);
     const now = Date.now();
     let reply: unknown;
@@ -569,7 +586,9 @@ export class BrokerService {
         data,
         deliveryCount: deliveries,
         redelivered: deliveries > 1,
-        visibleAt: now + visibilityMs,
+        // Deadline-free holds report no deadline (0), exactly like the
+        // stored hash the script wrote.
+        visibleAt: noExpiry ? 0 : now + visibilityMs,
       });
     }
     return { consumerId, messages };
@@ -728,8 +747,51 @@ export class BrokerService {
       cursor = asString(parts[2], "cancelConsumer");
       if (cursor === "0") break;
     }
-    // Past the page bound, leftovers stay leased and redeliver on
-    // visibility timeout — never silently dropped.
+    // Past the page bound, leftovers stay leased: finite-lease ones
+    // still redeliver on visibility timeout, deadline-free ones are
+    // recovered on restart or the next cancel — never silently dropped.
+    if (requeued > 0) this.notifyChanged(queue);
+    return { requeued };
+  }
+
+  /**
+   * Boot recovery: requeue every leased message of a queue and drop its
+   * stale consumer state. Only safe when no consumer can be live (server
+   * start) — afterwards the queue is as if every holder disconnected at
+   * once, RabbitMQ-restart style.
+   */
+  async requeueOrphanedLeases(queue: string): Promise<{ requeued: number }> {
+    const keys = queueKeys(this.options.prefix, queue);
+    const now = Date.now();
+    let cursor = "0";
+    let requeued = 0;
+    for (let page = 0; page < RECOVER_MAX_PAGES; page += 1) {
+      let reply: unknown;
+      try {
+        reply = await this.call("themqRecoverOrphans", [
+          keys.registry,
+          keys.meta,
+          keys.ready,
+          keys.unacked,
+          keys.consumers,
+          queue,
+          now,
+          keys.messagePrefix,
+          keys.pendingPrefix,
+          cursor,
+          SCAN_COUNT,
+        ]);
+      } catch (err) {
+        throw classifyBackendError(err, "recover orphaned leases");
+      }
+      const parts = asArray(reply, "recoverOrphans");
+      if (asString(parts[0], "recoverOrphans") === "NOT_FOUND") {
+        throw ApiError.notFound("queue", queue);
+      }
+      requeued += asNumber(parts[1], "recoverOrphans");
+      cursor = asString(parts[2], "recoverOrphans");
+      if (cursor === "0") break;
+    }
     if (requeued > 0) this.notifyChanged(queue);
     return { requeued };
   }

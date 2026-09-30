@@ -164,21 +164,25 @@ a consume call never depends on background timing.
 frame the moment a message becomes available — no polling.
 
 ```text
-Client →  { "action": "hello", "consumerId": "worker-1",
-            "prefetch": 10, "visibilityTimeoutMs": 30000 }
+Client →  { "action": "hello", "consumerId": "worker-1", "prefetch": 10 }
 Server →  { "type": "ready", "queue": "orders", "consumerId": "worker-1",
             "prefetch": 10, "visibilityTimeoutMs": 30000 }
 Server →  { "type": "message", "queue": "orders", "id": "msg_123",
             "consumerId": "worker-1", "data": {...},
-            "deliveryCount": 1, "redelivered": false,
-            "visibleAt": 1758840630000 }
+            "deliveryCount": 1, "redelivered": false, "visibleAt": 0 }
 Client →  { "action": "ack", "id": "msg_123" }
 Server →  { "type": "acked", "id": "msg_123", "deliveries": 1 }
 ```
 
+Deliveries are held RabbitMQ-style: **no visibility deadline**, so a
+message stays leased however long processing takes — it returns to the
+queue only when requeued, or when the connection drops. `visibleAt` is
+therefore `0` on subscribed messages.
+
 Hello fields: `consumerId` (optional, generated when omitted),
-`prefetch` (1–1000, default `DEFAULT_PREFETCH`), `visibilityTimeoutMs`
-(100–43200000, default `DEFAULT_VISIBILITY_TIMEOUT_MS`). The first frame
+`prefetch` (1–1000, default `DEFAULT_PREFETCH`). `visibilityTimeoutMs`
+(100–43200000) is still accepted for backward compatibility but no
+longer sets an expiry. The first frame
 must be `hello` (10 s grace, then the socket closes with code `4400`).
 
 Client actions:
@@ -199,6 +203,9 @@ Lifecycle:
 - Closing the socket requeues the consumer's pending messages, so
   unacknowledged work is redelivered — the same guarantee a dropped
   consumer connection gives.
+- A server restart requeues every leased message before serving
+  traffic, so deadline-free holds survive restarts with redelivery
+  (marking them `redelivered` with a bumped `deliveryCount`).
 - Deleting the queue closes subscribers with code `4410`.
 - Subscribing to an unknown queue sends `NOT_FOUND` and closes with
   `4404` (declare or publish first).

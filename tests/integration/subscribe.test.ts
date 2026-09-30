@@ -64,10 +64,21 @@ function openConsumer(
     const queued = queue_.shift();
     if (queued) return Promise.resolve(queued);
     return new Promise<ServerFrame>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        reject(new Error("Timed out waiting for server frame"));
-      }, timeoutMs);
-      waiters.push({ resolve, reject, timer });
+      const waiter: {
+        resolve: (frame: ServerFrame) => void;
+        reject: (err: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+      } = {
+        resolve,
+        reject,
+        timer: setTimeout(() => {
+          // A timed-out wait must not swallow a later frame.
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          reject(new Error("Timed out waiting for server frame"));
+        }, timeoutMs),
+      };
+      waiters.push(waiter);
     });
   };
   return { ws, nextFrame, closed };
@@ -221,6 +232,34 @@ describe("persistent consumers (WebSocket subscribe)", () => {
       id: "nope",
     });
     expect(ws.readyState).toBe(WebSocket.OPEN);
+    ws.close();
+  });
+
+  it("holds subscribed messages without a deadline, however short the hello lease", async () => {
+    await declareQueue("hold");
+    const { ws, nextFrame } = openConsumer(base, "hold");
+    await waitOpen(ws);
+    // 100ms is the shortest lease the hello schema accepts — the server
+    // must ignore it for persistent deliveries (RabbitMQ manual-ack style).
+    ws.send(
+      JSON.stringify({ action: "hello", consumerId: "c1", prefetch: 5, visibilityTimeoutMs: 100 }),
+    );
+    await nextFrame();
+
+    const { id } = await publish("hold", { data: "patient" });
+    const delivered = await nextFrame();
+    expect(delivered).toMatchObject({ id, deliveryCount: 1, redelivered: false });
+
+    // Several sweeper intervals pass: no redelivery may arrive.
+    await expect(nextFrame(700)).rejects.toThrow("Timed out waiting for server frame");
+    const stats = (await (await fetch(`${base}/queues/hold`)).json()) as {
+      ready: number;
+      unacked: number;
+    };
+    expect(stats).toMatchObject({ ready: 0, unacked: 1 });
+
+    ws.send(JSON.stringify({ action: "ack", id }));
+    await expect(nextFrame()).resolves.toMatchObject({ type: "acked", id, deliveries: 1 });
     ws.close();
   });
 

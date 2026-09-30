@@ -26,32 +26,34 @@ Queue
 Options
   + Acknowledge
   + Max Concurrent Executions
-  + Max Processing Time (Ms)
 ```
 
 ### Acknowledge
 
 Every delivered message is leased, not given away: it must be
-acknowledged, or it comes back. When the acknowledgement happens depends
+acknowledged, or it comes back. There is **no deadline** — like a
+RabbitMQ manual-ack consumer, the broker holds the message however
+long the workflow takes. When the acknowledgement happens depends
 on this mode:
 
 - **Immediately** — acknowledged as soon as it arrives, with no
-  concurrency limit. The workflow still runs, but a later failure can no
+  concurrency limit (RabbitMQ auto-ack). The workflow still runs, but a later failure can no
   longer return the message. Use it when losing a message on failure is
   acceptable.
 - **Execution Finishes** — acknowledged when the execution finishes,
-  whether it succeeded or not.
-- **Execution Finishes Successfully** — acknowledged only on success. On
-  failure the message goes back to the queue and is delivered again
-  (with `redelivered: true` and a higher `deliveryCount`).
+  however long that takes, whether it succeeded or not.
+- **Execution Finishes Successfully** — acknowledged only on success, however
+  long that takes. On failure the message goes back to the queue and is
+  delivered again (with `redelivered: true` and a higher `deliveryCount`).
 - **Specified Later in Workflow** — the trigger does not settle. Add a
   **TheMQ → Acknowledge** node where the message is truly done; its
-  fields pick up the trigger item automatically. If the run ends without
+  fields pick up the trigger item automatically. The message stays held
+  without a deadline until then. If the run ends without
   acknowledgement, success acknowledges and failure returns the message.
 
-Whichever mode you pick, two rules always hold: a message that is still
-unacknowledged when **Max Processing Time** passes is handed out again,
-and a dropped connection returns its pending messages immediately.
+Whichever mode you pick, a dropped connection returns its pending
+messages immediately for redelivery. Delivery is at-least-once:
+keep your workflow idempotent if duplicates would hurt.
 
 ### Max Concurrent Executions
 
@@ -62,14 +64,6 @@ is acknowledged. The option is hidden while Acknowledge is
 `Immediately` — with nothing ever left unacknowledged there is nothing
 to cap, so that mode flows without a limit. Raise the limit when your
 workflow can safely run in parallel.
-
-### Max Processing Time (Ms)
-
-The lease per message in milliseconds (default `60000`, allowed
-`100`–`43200000`). Each message must be acknowledged within this time
-or it is delivered again to another execution — and may then run twice.
-Set it above your longest run. Delivery is therefore at-least-once:
-keep your workflow idempotent if duplicates would hurt.
 
 A message that keeps failing will keep coming back. To stop the loop,
 check `deliveryCount` with an IF node and route poison messages to an

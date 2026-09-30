@@ -49,7 +49,11 @@ function errorFrame(code: string, message: string, id?: string): ServerFrame {
  * The client opens a WebSocket, sends one `hello`, then receives
  * `message` frames as deliveries happen — no polling. It settles with
  * `ack` / `requeue` frames and ends with `cancel` or by closing.
- * Closing requeues pending messages, so unacked work is redelivered.
+ * Deliveries are held RabbitMQ-style: no visibility deadline, so a
+ * message stays leased however long processing takes. Closing (or a
+ * dropped connection) requeues pending messages, so unacknowledged
+ * work is redelivered. The `visibilityTimeoutMs` hello field is
+ * accepted for backward compatibility but no longer sets an expiry.
  */
 export function registerSubscribeRoutes(app: AppInstance, services: ApiServices): void {
   const { broker, subscriptions, logger, config } = services;

@@ -299,6 +299,46 @@ describe("broker publish/consume/ack", () => {
     expect(inspected.state).toBe("unacked");
   });
 
+  it("holds noExpiry leases past sweeps without redelivery", async () => {
+    await system.broker.publish("q", { message: "hello" }, { id: "msg_hold" });
+    const first = await system.broker.consume("q", { consumerId: "c1", noExpiry: true });
+    expect(first.messages[0]?.visibleAt).toBe(0);
+    // Sweep repeatedly: a deadline-free lease must never be reclaimed.
+    for (let i = 0; i < 3; i += 1) {
+      const swept = await system.broker.sweep("q");
+      expect(swept.reclaimed).toBe(0);
+    }
+    expect((await system.broker.getQueue("q")).unacked).toBe(1);
+    expect((await system.broker.consume("q", { consumerId: "c2" })).messages).toHaveLength(0);
+    // The hold settles normally.
+    await system.broker.ack("q", "msg_hold", "c1");
+    expect((await system.broker.getQueue("q")).unacked).toBe(0);
+  });
+
+  it("requeueOrphanedLeases recovers every leased message, then reports none", async () => {
+    await system.broker.publish("q", { n: 1 }, { id: "msg_o1" });
+    await system.broker.publish("q", { n: 2 }, { id: "msg_o2" });
+    await system.broker.consume("q", { consumerId: "dead-conn", count: 2, noExpiry: true });
+    expect((await system.broker.getQueue("q")).unacked).toBe(2);
+    const recovered = await system.broker.requeueOrphanedLeases("q");
+    expect(recovered.requeued).toBe(2);
+    const stats = await system.broker.getQueue("q");
+    expect(stats).toMatchObject({ ready: 2, unacked: 0 });
+    // Recovery is RabbitMQ-restart style: redelivered with a bumped count.
+    const next = await system.broker.consume("q", { consumerId: "c2", count: 2 });
+    expect(next.messages).toHaveLength(2);
+    for (const message of next.messages) {
+      expect(message.deliveryCount).toBe(2);
+      expect(message.redelivered).toBe(true);
+    }
+    expect((await system.broker.getQueue("q")).unacked).toBe(2);
+    // With nothing leased, recovery reports zero.
+    await system.broker.ack("q", "msg_o1", "c2");
+    await system.broker.ack("q", "msg_o2", "c2");
+    expect((await system.broker.requeueOrphanedLeases("q")).requeued).toBe(0);
+    await expectCode(system.broker.requeueOrphanedLeases("missing"), "NOT_FOUND");
+  });
+
   it("cancelling a consumer requeues its leases", async () => {
     for (let i = 0; i < 3; i += 1) {
       await system.broker.publish("q", { n: i }, { id: `msg_c${String(i)}` });

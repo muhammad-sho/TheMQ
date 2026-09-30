@@ -25,7 +25,7 @@ export interface BrokerMessage {
   deliveryCount: number;
   /** Epoch ms when the message becomes (or became) available. */
   availableAt: number;
-  /** Epoch ms when an unacked lease expires (`0` unless unacked). */
+  /** Epoch ms when an unacked lease expires (`0` = no deadline). */
   visibleAt: number;
   createdAt: number;
   updatedAt: number;
@@ -38,7 +38,11 @@ export interface ConsumedMessage {
   deliveryCount: number;
   /** True when this message was delivered before (retry/redelivery). */
   redelivered: boolean;
-  /** Epoch ms when the lease expires if the message is not acked. */
+  /**
+   * Epoch ms when the lease expires if the message is not acked
+   * (`0` = held without a deadline until settled or disconnected,
+   * RabbitMQ manual-ack style).
+   */
   visibleAt: number;
 }
 

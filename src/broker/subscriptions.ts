@@ -16,6 +16,11 @@ export interface SubscriberOptions {
   consumerId?: string | undefined;
   /** Max messages leased to this consumer at once (server-enforced). */
   prefetch: number;
+  /**
+   * Accepted for backward compatibility with older hellos; persistent
+   * deliveries are held without a deadline (RabbitMQ manual-ack style),
+   * so this no longer sets an expiry.
+   */
   visibilityTimeoutMs: number;
   /** Called once per delivered message; throwing marks the subscriber broken. */
   send: (message: OutgoingMessage) => void;
@@ -161,11 +166,13 @@ export class SubscriptionManager {
     for (;;) {
       let result: { messages: ConsumedMessage[] };
       try {
+        // Persistent deliveries never expire: held until acked,
+        // requeued, or disconnected (RabbitMQ manual-ack semantics).
         result = await this.broker.consume(subscriber.queue, {
           consumerId: subscriber.consumerId,
           count: subscriber.prefetch,
           prefetch: subscriber.prefetch,
-          visibilityTimeoutMs: subscriber.visibilityTimeoutMs,
+          noExpiry: true,
         });
       } catch (err) {
         if (err instanceof ApiError && err.code === "NOT_FOUND") {
@@ -184,7 +191,7 @@ export class SubscriptionManager {
           });
         } catch (err) {
           // Broken socket: its close handler cancels the consumer, so
-          // leases requeue. Leases made here redeliver on timeout.
+          // leases requeue on disconnect.
           this.logger?.warn(
             { err, queue: subscriber.queue, consumer: subscriber.consumerId },
             "Subscriber send failed; dropping subscription",
