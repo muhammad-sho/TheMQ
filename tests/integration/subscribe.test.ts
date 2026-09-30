@@ -282,6 +282,38 @@ describe("persistent consumers (WebSocket subscribe)", () => {
     expect(body.messages[0]?.deliveryCount).toBe(2);
   });
 
+  it("supports a reconnect cycle: drop, resubscribe, redeliver, settle", async () => {
+    await declareQueue("reconnect");
+    const first = openConsumer(base, "reconnect");
+    await waitOpen(first.ws);
+    first.ws.send(JSON.stringify({ action: "hello", consumerId: "c-old", prefetch: 5 }));
+    await first.nextFrame();
+
+    const { id } = await publish("reconnect", { data: "held" });
+    const delivered = await first.nextFrame();
+    expect(delivered).toMatchObject({ id, deliveryCount: 1, redelivered: false });
+
+    // Connection dies mid-processing (server restart, deploy, blip).
+    first.ws.terminate();
+    await first.closed;
+
+    // Client reconnects with a fresh consumer: the lease was requeued on
+    // drop, so the message comes back marked redelivered — and settles.
+    // (The redelivery may arrive before the ready frame; both orders occur.)
+    const second = openConsumer(base, "reconnect");
+    await waitOpen(second.ws);
+    second.ws.send(JSON.stringify({ action: "hello", consumerId: "c-new", prefetch: 5 }));
+    const frameA = await second.nextFrame();
+    const frameB = await second.nextFrame();
+    const frames = [frameA, frameB];
+    expect(frames).toContainEqual(expect.objectContaining({ type: "ready", consumerId: "c-new" }));
+    const redelivered = frames.find((frame) => frame["type"] === "message");
+    expect(redelivered).toMatchObject({ id, deliveryCount: 2, redelivered: true });
+    second.ws.send(JSON.stringify({ action: "ack", id }));
+    await expect(second.nextFrame()).resolves.toMatchObject({ type: "acked", id, deliveries: 2 });
+    second.ws.close();
+  });
+
   it("pushes TTL-delayed messages as soon as they become available", async () => {
     await declareQueue("delayed");
     const { ws, nextFrame } = openConsumer(base, "delayed");

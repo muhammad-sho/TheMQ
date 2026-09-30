@@ -52,7 +52,11 @@ on this mode:
   acknowledgement, success acknowledges and failure returns the message.
 
 Whichever mode you pick, a dropped connection returns its pending
-messages immediately for redelivery. Delivery is at-least-once:
+messages immediately for redelivery. If the connection drops while the
+workflow is active (TheMQ restart, deploy, network blip), the trigger
+reconnects on its own with backoff instead of failing — only
+misconfiguration (bad credentials, deleted queue, protocol errors)
+deactivates it with an error. Delivery is at-least-once:
 keep your workflow idempotent if duplicates would hurt.
 
 ### Max Concurrent Executions

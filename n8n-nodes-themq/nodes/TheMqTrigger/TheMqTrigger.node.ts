@@ -51,6 +51,20 @@ const CLOSE_GRACE_MS = 5000;
 const CLOSE_WAIT_MAX_ROUNDS = 60;
 const CLOSE_WAIT_INTERVAL_MS = 1000;
 const WS_NORMAL_CLOSE = 1000;
+const RECONNECT_INITIAL_MS = 1000;
+const RECONNECT_MAX_MS = 30_000;
+const RECONNECT_JITTER_MS = 1000;
+/**
+ * Close codes that never trigger a reconnect: clean shutdowns plus
+ * server rejections no retry can fix (auth/queue/protocol).
+ */
+const NO_RECONNECT_CLOSE = new Set([WS_NORMAL_CLOSE, 4400, 4404, 4410]);
+
+/** Permanent connection failures (bad credentials, gone queue): surface, don't loop. */
+function isFatalConnectionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /401|unauthorized|NOT_FOUND/i.test(message);
+}
 
 /** A message the broker failed to settle because it is already gone. */
 function isAlreadySettled(error: unknown): boolean {
@@ -264,12 +278,25 @@ export class TheMqTrigger implements INodeType {
     let closeRequested = false;
     let socket: WebSocket | undefined;
     let activeConsumerId = "";
+    // Manual test runs are one-shot: never reconnect, fail visibly instead.
+    const isManualRun = this.getMode() === "manual";
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectDelayMs = RECONNECT_INITIAL_MS;
 
     const logError = (message: string): void => {
       const workflow = this.getWorkflow();
       const node = this.getNode();
       this.logger.error(
         `There was a problem with TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
+        { node: node.name, workflowId: workflow.id },
+      );
+    };
+
+    const logWarn = (message: string): void => {
+      const workflow = this.getWorkflow();
+      const node = this.getNode();
+      this.logger.warn(
+        `TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
         { node: node.name, workflowId: workflow.id },
       );
     };
@@ -507,6 +534,10 @@ export class TheMqTrigger implements INodeType {
 
     const closeFunction = async (): Promise<void> => {
       closeRequested = true;
+      if (reconnectTimer !== undefined) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
       // Bounded grace period for in-flight executions; leftovers requeue
       // server-side on close.
       let waits = 0;
@@ -562,11 +593,47 @@ export class TheMqTrigger implements INodeType {
           pending.reject(new Error("TheMQ connection closed"));
         }
         pendingSettles.clear();
-        if (!closeRequested) {
-          this.emitError(new Error(`TheMQ connection closed unexpectedly (code ${String(code)})`));
+        if (closeRequested) return;
+        // Manual test runs fail visibly; the live trigger rides out
+        // transport drops (server restarts, deploys, blips) by
+        // reconnecting — the server requeued our leases on its side.
+        // Only rejections no retry can fix surface as errors.
+        if (isManualRun || NO_RECONNECT_CLOSE.has(code)) {
+          this.emitError(new Error(`TheMQ connection closed (code ${String(code)})`));
+          return;
         }
+        scheduleReconnect();
       });
       return ready.early;
+    };
+
+    /** Re-establish the consumer after a drop; back off while unreachable. */
+    const establish = async (): Promise<void> => {
+      const early = await connectConsumer(prefetch, true);
+      reconnectDelayMs = RECONNECT_INITIAL_MS;
+      for (const message of early) {
+        void handleMessage(message);
+      }
+    };
+
+    const scheduleReconnect = (): void => {
+      if (closeRequested || isManualRun || reconnectTimer !== undefined) return;
+      const wait = reconnectDelayMs + Math.floor(Math.random() * RECONNECT_JITTER_MS);
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
+      logWarn(`connection lost; reconnecting in ${(wait / 1000).toFixed(1)}s`);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        if (closeRequested) return;
+        establish().catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          if (isFatalConnectionError(error)) {
+            this.emitError(new Error(message));
+            return;
+          }
+          logWarn(`reconnect failed (${message}); retrying`);
+          scheduleReconnect();
+        });
+      }, wait);
     };
 
     if (this.getMode() === "manual") {
@@ -618,11 +685,10 @@ export class TheMqTrigger implements INodeType {
       };
     }
 
-    const early = await connectConsumer(prefetch, true);
-    // Replay pre-ready deliveries through the normal path.
-    for (const message of early) {
-      void handleMessage(message);
-    }
+    // Initial connect still throws: misconfiguration (bad URL, bad
+    // token) must fail activation visibly. Only established drops
+    // reconnect.
+    await establish();
 
     return {
       closeFunction,
