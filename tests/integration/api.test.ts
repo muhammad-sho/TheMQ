@@ -71,10 +71,62 @@ describe("broker HTTP API", () => {
     res = await fetch(`${base}/queues/hello/messages/msg_123/ack`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ consumerId: "worker-1" }),
+      body: JSON.stringify({}),
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ acked: true });
+  });
+
+  it("requeues leased messages plainly or on new terms", async () => {
+    await fetch(`${base}/queues/rq`, { method: "PUT" });
+    const post = (id: string, path: string, body: unknown): Promise<Response> =>
+      fetch(`${base}/queues/rq/messages/${id}/${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const publish = (id: string, data: unknown): Promise<Response> =>
+      fetch(`${base}/queues/rq/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, data }),
+      });
+    const consume = (): Promise<{ messages: Array<{ id: string }> }> =>
+      fetch(`${base}/queues/rq/consume`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ count: 10 }),
+      }).then((res) => res.json()) as Promise<{ messages: Array<{ id: string }> }>;
+
+    // Waiting messages cannot be requeued: upsert edits those instead.
+    await publish("waiting", { v: 1 });
+    let res = await post("waiting", "requeue", {});
+    expect(res.status).toBe(409);
+
+    // Plain requeue: tail, original details.
+    await publish("plain", { v: 1 });
+    await consume();
+    res = await post("plain", "requeue", {});
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ requeued: true, state: "ready", deliveries: 1 });
+
+    // New payload + delay: delayed state, edited data, bumped count on redelivery.
+    await publish("terms", { v: 1 });
+    await consume();
+    res = await post("terms", "requeue", { data: { v: 2 }, ttlMs: 300 });
+    expect(res.status).toBe(200);
+    const requeued = (await res.json()) as { state: string; availableAt: number };
+    expect(requeued.state).toBe("delayed");
+    expect(requeued.availableAt).toBeGreaterThan(Date.now());
+    expect((await consume()).messages.map((m) => m.id)).not.toContain("terms");
+
+    // Unknown requeue fields and bad delays are validation errors.
+    res = await post("terms", "requeue", { consumerId: "c1" });
+    expect(res.status).toBe(400);
+    res = await post("terms", "requeue", { ttlMs: -1 });
+    expect(res.status).toBe(400);
+    res = await post("missing", "requeue", {});
+    expect(res.status).toBe(404);
   });
 
   it("requires a message id and supports upsert publishing", async () => {

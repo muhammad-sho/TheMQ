@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   consumeSchema,
-  leaseBodySchema,
   publishMessageSchema,
+  requeueBodySchema,
   setTtlSchema,
 } from "../../src/api/schemas/messages.js";
 
@@ -58,8 +58,12 @@ describe("broker schemas", () => {
     expect(setTtlSchema.safeParse({ ttl: -1 }).success).toBe(false);
   });
 
-  it("accepts empty lease bodies", () => {
-    expect(leaseBodySchema.safeParse({}).success).toBe(true);
-    expect(leaseBodySchema.safeParse(undefined).success).toBe(false);
+  it("accepts requeue terms: empty, data, delay, or both", () => {
+    expect(requeueBodySchema.safeParse({}).success).toBe(true);
+    expect(requeueBodySchema.safeParse({ data: { attempt: 2 } }).success).toBe(true);
+    expect(requeueBodySchema.safeParse({ ttlMs: 60000 }).success).toBe(true);
+    expect(requeueBodySchema.safeParse({ data: [1], ttlMs: 0 }).success).toBe(true);
+    expect(requeueBodySchema.safeParse({ ttlMs: -1 }).success).toBe(false);
+    expect(requeueBodySchema.safeParse({ consumerId: "c1" }).success).toBe(false);
   });
 });

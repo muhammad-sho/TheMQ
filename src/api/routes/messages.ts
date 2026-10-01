@@ -1,8 +1,8 @@
 import type { AppInstance, ApiServices } from "../server.js";
 import {
   consumeSchema,
-  leaseBodySchema,
   publishMessageSchema,
+  requeueBodySchema,
   setTtlSchema,
 } from "../schemas/messages.js";
 import { consumerParamsSchema, messageParamsSchema, queueParamsSchema } from "../schemas/common.js";
@@ -44,16 +44,18 @@ export function registerMessageRoutes(app: AppInstance, services: ApiServices): 
 
   app.post("/queues/:queue/messages/:id/ack", async (request) => {
     const params = parseWith(messageParamsSchema, request.params, "path parameters");
-    const body = parseWith(leaseBodySchema, request.body ?? {}, "request body");
-    const { deliveries } = await broker.ack(params.queue, params.id, body.consumerId);
+    const { deliveries } = await broker.ack(params.queue, params.id);
     return { id: params.id, queue: params.queue, acked: true, deliveries };
   });
 
   app.post("/queues/:queue/messages/:id/requeue", async (request) => {
     const params = parseWith(messageParamsSchema, request.params, "path parameters");
-    const body = parseWith(leaseBodySchema, request.body ?? {}, "request body");
-    const { deliveries } = await broker.requeue(params.queue, params.id, body.consumerId);
-    return { id: params.id, queue: params.queue, requeued: true, state: "ready", deliveries };
+    const input = parseWith(requeueBodySchema, request.body ?? {}, "request body");
+    const requeued = await broker.requeue(params.queue, params.id, {
+      ...(input.data !== undefined ? { data: input.data } : {}),
+      ...(input.ttlMs !== undefined ? { ttlMs: input.ttlMs } : {}),
+    });
+    return { ...requeued };
   });
 
   app.delete("/queues/:queue/messages/:id", async (request, reply) => {

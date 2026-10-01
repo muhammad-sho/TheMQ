@@ -49,10 +49,15 @@ export const consumeSchema = z
   })
   .strict();
 
-/** Optional owner check for ack/requeue (prevents acking another consumer's lease). */
-export const leaseBodySchema = z
+/**
+ * Requeue a leased message on new terms: replacement payload and/or
+ * delay before it becomes available again. Empty body = plain tail
+ * requeue with the original details.
+ */
+export const requeueBodySchema = z
   .object({
-    consumerId: consumerIdSchema.optional(),
+    data: z.json().optional(),
+    ttlMs: z.number().int().min(0).max(TTL_MAX_MS).optional(),
   })
   .strict();
 

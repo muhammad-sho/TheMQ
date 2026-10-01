@@ -69,6 +69,13 @@ export class TheMq implements INodeType {
             action: "Acknowledge a message",
           },
           {
+            name: "Requeue",
+            value: "requeue",
+            description:
+              "Return a leased message to the queue, optionally with a new payload and delay",
+            action: "Requeue a message",
+          },
+          {
             name: "Delete Message",
             value: "delete",
             description: "Delete a waiting message so it is never processed",
@@ -145,13 +152,28 @@ export class TheMq implements INodeType {
         description: "Wait this long before the message becomes available (0 = immediately)",
       },
       {
-        displayName: "Consumer ID",
-        name: "consumerId",
-        type: "string",
-        default: "={{ $json.consumerId }}",
-        displayOptions: { show: { operation: ["ack"] } },
-        description:
-          "Consumer holding the lease (taken from the trigger item when connected). Only change this to settle another consumer's message.",
+        displayName: "Options",
+        name: "options",
+        type: "collection",
+        default: {},
+        placeholder: "Add option",
+        displayOptions: { show: { operation: ["requeue"] } },
+        options: [
+          {
+            displayName: "Message Data",
+            name: "messageData",
+            type: "json",
+            default: '{\n  "message": "hello"\n}',
+            description: "Replacement payload for the next delivery",
+          },
+          {
+            displayName: "Delay (Ms)",
+            name: "ttlMs",
+            type: "number",
+            default: 60000,
+            description: "Wait this long before the message becomes available again",
+          },
+        ],
       },
     ],
   };
@@ -203,15 +225,12 @@ export class TheMq implements INodeType {
           );
           returnData.push({ json: toDataObject(response) });
         } else if (operation === "ack") {
-          const consumerId = strParam(this.getNodeParameter("consumerId", i, "")).trim();
-          const body: Record<string, unknown> = {};
-          if (consumerId !== "") body["consumerId"] = consumerId;
           const response = toDataObject(
             await request.call(
               this,
               "POST",
               `/queues/${encode(queue)}/messages/${encode(messageId)}/ack`,
-              body,
+              undefined,
               { itemIndex: i, operation, queue, messageId },
             ),
           );
@@ -223,6 +242,37 @@ export class TheMq implements INodeType {
             // ignore — standalone acknowledgement already succeeded
           }
           returnData.push({ json: { queue, messageId, acked: true, ...response } });
+        } else if (operation === "requeue") {
+          const options = this.getNodeParameter("options", i, {}) as {
+            messageData?: unknown;
+            ttlMs?: number;
+          };
+          const body: Record<string, unknown> = {};
+          if (options.messageData !== undefined) {
+            const dataParam: unknown = options.messageData;
+            if (typeof dataParam === "string") {
+              try {
+                body["data"] = JSON.parse(dataParam) as unknown;
+              } catch {
+                throw new NodeOperationError(this.getNode(), "Message Data is not valid JSON.", {
+                  itemIndex: i,
+                });
+              }
+            } else {
+              body["data"] = dataParam;
+            }
+          }
+          if (typeof options.ttlMs === "number" && options.ttlMs > 0) {
+            body["ttlMs"] = Math.floor(options.ttlMs);
+          }
+          const response = await request.call(
+            this,
+            "POST",
+            `/queues/${encode(queue)}/messages/${encode(messageId)}/requeue`,
+            body,
+            { itemIndex: i, operation, queue, messageId },
+          );
+          returnData.push({ json: toDataObject(response) });
         } else if (operation === "delete") {
           await request.call(
             this,
@@ -312,7 +362,10 @@ function hintForCode(code: string, operation: string, message: string): string {
         return "A message with this ID already exists. Enable Upsert to update it, or set On Conflict to Skip.";
       }
       if (operation === "ack") {
-        return "The message is not leased to this consumer. It may already be settled or held by another consumer — check the Consumer ID.";
+        return "The message is not leased. It may already be settled, or never picked up yet.";
+      }
+      if (operation === "requeue") {
+        return "Only leased messages (picked up but unacked) can be requeued. Waiting messages are edited with upsert instead.";
       }
       return "The message is leased (unacked). Acknowledge it first.";
     case "SERVICE_UNAVAILABLE":

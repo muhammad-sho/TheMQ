@@ -1,7 +1,9 @@
 import type * as WebSocket from "ws";
 import { ApiError } from "../errors.js";
 import { frameToString } from "../frames.js";
+import { requeueBodySchema } from "../schemas/messages.js";
 import type { OutgoingMessage, SubscriberHandle } from "../../broker/subscriptions.js";
+import type { Json } from "../../broker/types.js";
 import { queueParamsSchema } from "../schemas/common.js";
 import { helloSchema } from "../schemas/subscribe.js";
 import { parseWith } from "./helpers.js";
@@ -45,8 +47,8 @@ function errorFrame(code: string, message: string, id?: string): ServerFrame {
  * Deliveries are held RabbitMQ-style: no visibility deadline, so a
  * message stays leased however long processing takes. Closing (or a
  * dropped connection) requeues pending messages, so unacknowledged
- * work is redelivered. The `visibilityTimeoutMs` hello field is
- * accepted for backward compatibility but no longer sets an expiry.
+ * work is redelivered. Requeue frames accept a new payload and/or
+ * delay to redeliver on new terms.
  */
 export function registerSubscribeRoutes(app: AppInstance, services: ApiServices): void {
   const { broker, subscriptions, logger, config } = services;
@@ -193,9 +195,6 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
           queue,
           consumerId,
           prefetch: input.prefetch ?? config.defaultPrefetch,
-          // Echoed for wire compatibility only; persistent deliveries
-          // carry no deadline.
-          visibilityTimeoutMs: config.defaultVisibilityTimeoutMs,
         });
         logger.info({ event: "subscribed", queue, consumer: consumerId }, "Consumer connected");
         heartbeatTimer = setInterval(() => {
@@ -274,6 +273,35 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
       };
     }
 
+    /**
+     * Optional requeue terms from the frame; unknown or invalid extras
+     * are a protocol error, never a silent plain requeue.
+     */
+    function parseRequeueExtras(
+      record: Record<string, unknown>,
+    ): { data?: Json; ttlMs?: number } | undefined {
+      const candidate: Record<string, unknown> = {};
+      if (record["data"] !== undefined) candidate["data"] = record["data"];
+      if (record["ttlMs"] !== undefined) candidate["ttlMs"] = record["ttlMs"];
+      const result = requeueBodySchema.safeParse(candidate);
+      if (!result.success) {
+        const id = record["id"];
+        sendFrame(
+          socket,
+          errorFrame(
+            "PROTOCOL_ERROR",
+            "Invalid requeue options.",
+            typeof id === "string" ? id : undefined,
+          ),
+        );
+        return undefined;
+      }
+      return {
+        ...(result.data.data !== undefined ? { data: result.data.data } : {}),
+        ...(result.data.ttlMs !== undefined ? { ttlMs: result.data.ttlMs } : {}),
+      };
+    }
+
     async function onActionFrame(
       record: Record<string, unknown>,
       sub: SubscriberHandle,
@@ -285,22 +313,30 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
           sendFrame(socket, errorFrame("PROTOCOL_ERROR", "Action frames need a message id."));
           return;
         }
-        try {
-          const settled =
-            action === "ack"
-              ? await broker.ack(queue, id, sub.consumerId)
-              : await broker.requeue(queue, id, sub.consumerId);
-          sendFrame(socket, {
-            type: action === "ack" ? "acked" : "requeued",
-            id,
-            deliveries: settled.deliveries,
-          });
-        } catch (err) {
-          if (err instanceof ApiError) {
-            sendFrame(socket, errorFrame(err.code, err.message, id));
-            return;
+        if (action === "ack") {
+          try {
+            const { deliveries } = await broker.ack(queue, id);
+            sendFrame(socket, { type: "acked", id, deliveries });
+          } catch (err) {
+            if (err instanceof ApiError) {
+              sendFrame(socket, errorFrame(err.code, err.message, id));
+              return;
+            }
+            throw err;
           }
-          throw err;
+        } else {
+          const extras = parseRequeueExtras(record);
+          if (extras === undefined) return;
+          try {
+            const requeued = await broker.requeue(queue, id, extras);
+            sendFrame(socket, { type: "requeued", ...requeued });
+          } catch (err) {
+            if (err instanceof ApiError) {
+              sendFrame(socket, errorFrame(err.code, err.message, id));
+              return;
+            }
+            throw err;
+          }
         }
         // Capacity freed — top this consumer up immediately.
         await subscriptions.fillConsumer(sub).catch((err: unknown) => {

@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-themq",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Native n8n community nodes for TheMQ — a lightweight, Redis-backed queue/consumer message broker.",
   "keywords": [
     "n8n-community-node-package",

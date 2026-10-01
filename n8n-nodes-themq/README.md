@@ -111,10 +111,10 @@ Fetch the current one from Redis or pin `API_TOKEN`.
 
 ## TheMQ node
 
-Exactly three operations — nothing else:
+Exactly four operations — nothing else:
 
 ```text
-Publish · Acknowledge · Delete Message
+Publish · Acknowledge · Requeue · Delete Message
 ```
 
 - **Publish** — Queue, Message ID (required; the upsert key), Message
@@ -123,8 +123,14 @@ Publish · Acknowledge · Delete Message
   `skipped: true` instead of failing — works for queued and leased
   messages), Delay (wait before the message becomes available).
 - **Acknowledge** — marks a trigger-delivered message as successfully
-  processed. Queue, Message ID, and Consumer ID default to the trigger
-  item, so no wiring is needed.
+  processed. Queue and Message ID default to the trigger item, so no
+  wiring is needed.
+- **Requeue** — returns a leased message (picked up but unacked) to the
+  queue. Queue and Message ID default to the trigger item; the optional
+  Options (+) take a replacement Message Data and a Delay before it
+  becomes available again. Empty options requeue with the original
+  details. Waiting messages (never picked up) are edited with Upsert
+  publish instead.
 - **Delete Message** — removes a waiting message so it is never
   processed. Queue and Message ID default to the trigger item.
 

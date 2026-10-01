@@ -205,15 +205,15 @@ describe("broker publish/consume/ack", () => {
 
   it("skips on a leased message and leaves the lease intact", async () => {
     await system.broker.publish("q", { v: 1 }, { id: "msg_skipl" });
-    const leased = await system.broker.consume("q", { consumerId: "c1" });
+    await system.broker.consume("q", { consumerId: "c1" });
     const skipped = await system.broker.publish(
       "q",
       { v: 2 },
       { id: "msg_skipl", onConflict: "skip" },
     );
     expect(skipped).toMatchObject({ skipped: true, state: "unacked" });
-    // The lease holder can still ack afterwards: nothing was disturbed.
-    await system.broker.ack("q", "msg_skipl", leased.consumerId);
+    // The message still acks afterwards: nothing was disturbed.
+    await system.broker.ack("q", "msg_skipl");
     expect((await system.broker.getQueue("q")).unacked).toBe(0);
   });
 
@@ -247,29 +247,31 @@ describe("broker publish/consume/ack", () => {
     expect(first.messages).toHaveLength(2);
     const second = await system.broker.consume("q", { consumerId: "c1", count: 10 });
     expect(second.messages).toHaveLength(0);
-    await system.broker.ack("q", first.messages[0]?.id ?? "", "c1");
+    await system.broker.ack("q", first.messages[0]?.id ?? "");
     const third = await system.broker.consume("q", { consumerId: "c1", count: 10 });
     expect(third.messages).toHaveLength(1);
   });
 
-  it("acks remove messages; wrong states and owners conflict", async () => {
+  it("acks remove messages by queue and id alone", async () => {
     const published = await system.broker.publish("q", { message: "hello" }, { id: "msg_ack" });
+    // Waiting messages cannot be settled.
     await expectCode(system.broker.ack("q", published.id), "CONFLICT");
-    const consumed = await system.broker.consume("q", { consumerId: "owner" });
-    const id = consumed.messages[0]?.id ?? "";
-    await expectCode(system.broker.ack("q", id, "someone-else"), "CONFLICT");
-    const acked = await system.broker.ack("q", id, "owner");
+    await system.broker.consume("q", { consumerId: "owner" });
+    // No ownership check: queue + id settle any holder's lease.
+    const acked = await system.broker.ack("q", published.id);
     expect(acked.deliveries).toBe(1);
-    await expectCode(system.broker.ack("q", id), "NOT_FOUND");
-    await expectCode(system.broker.getMessage("q", id), "NOT_FOUND");
+    await expectCode(system.broker.ack("q", published.id), "NOT_FOUND");
+    await expectCode(system.broker.getMessage("q", published.id), "NOT_FOUND");
     expect((await system.broker.getQueue("q")).acked).toBe(1);
+    await expectCode(system.broker.ack("q", "msg_missing"), "NOT_FOUND");
   });
 
   it("requeues leased messages for redelivery", async () => {
     await system.broker.publish("q", { message: "hello" }, { id: "msg_rq" });
     const first = await system.broker.consume("q", { consumerId: "c1" });
     const id = first.messages[0]?.id ?? "";
-    await system.broker.requeue("q", id, "c1");
+    const requeued = await system.broker.requeue("q", id);
+    expect(requeued).toMatchObject({ requeued: true, state: "ready", deliveries: 1 });
     const stats = await system.broker.getQueue("q");
     expect(stats.ready).toBe(1);
     expect(stats.unacked).toBe(0);
@@ -277,6 +279,71 @@ describe("broker publish/consume/ack", () => {
     expect(second.messages[0]?.id).toBe(id);
     expect(second.messages[0]?.deliveryCount).toBe(2);
     expect(second.messages[0]?.redelivered).toBe(true);
+  });
+
+  it("requeues with a new payload on the same id", async () => {
+    await system.broker.publish("q", { v: 1 }, { id: "msg_edit" });
+    await system.broker.consume("q", { consumerId: "c1" });
+    const requeued = await system.broker.requeue("q", "msg_edit", { data: { v: 2 } });
+    expect(requeued).toMatchObject({ requeued: true, state: "ready", deliveries: 1 });
+    expect(await system.broker.getMessage("q", "msg_edit")).toMatchObject({
+      data: { v: 2 },
+      state: "ready",
+    });
+    const second = await system.broker.consume("q", { consumerId: "c2" });
+    expect(second.messages[0]).toMatchObject({
+      id: "msg_edit",
+      data: { v: 2 },
+      deliveryCount: 2,
+      redelivered: true,
+    });
+  });
+
+  it("requeues with a delay as a delayed message", async () => {
+    await system.broker.publish("q", { message: "later" }, { id: "msg_delay" });
+    await system.broker.consume("q", { consumerId: "c1" });
+    const before = Date.now();
+    const requeued = await system.broker.requeue("q", "msg_delay", { ttlMs: 400 });
+    expect(requeued.state).toBe("delayed");
+    expect(requeued.availableAt).toBeGreaterThanOrEqual(before + 400);
+    expect((await system.broker.consume("q", { consumerId: "c2" })).messages).toHaveLength(0);
+    await waitFor(
+      async () => (await system.broker.consume("q", { consumerId: "c2" })).messages.length === 1,
+      { label: "requeue delay redelivery" },
+    );
+    const inspected = await system.broker.getMessage("q", "msg_delay");
+    expect(inspected.deliveryCount).toBeGreaterThanOrEqual(2);
+  });
+
+  it("requeues with a new payload and a delay together", async () => {
+    await system.broker.publish("q", { v: 1 }, { id: "msg_both" });
+    await system.broker.consume("q", { consumerId: "c1" });
+    const requeued = await system.broker.requeue("q", "msg_both", {
+      data: { v: 9 },
+      ttlMs: 300,
+    });
+    expect(requeued).toMatchObject({ requeued: true, state: "delayed" });
+    let redelivered: { id: string; data: unknown } | undefined;
+    await waitFor(
+      async () => {
+        const found = await system.broker.consume("q", { consumerId: "c2" });
+        if (found.messages.length === 1) {
+          redelivered = found.messages[0] as { id: string; data: unknown };
+          return true;
+        }
+        return false;
+      },
+      { label: "edited delay redelivery" },
+    );
+    expect(redelivered).toMatchObject({ id: "msg_both", data: { v: 9 } });
+  });
+
+  it("requeue rejects missing and non-leased messages", async () => {
+    await expectCode(system.broker.requeue("q", "msg_missing"), "NOT_FOUND");
+    await system.broker.publish("q", { message: "waiting" }, { id: "msg_wait" });
+    // Waiting messages are edited with upsert, never requeued.
+    await expectCode(system.broker.requeue("q", "msg_wait"), "CONFLICT");
+    await expectCode(system.broker.requeue("q", "msg_wait", { ttlMs: 100 }), "CONFLICT");
   });
 
   it("redelivers unacked messages after the visibility timeout", async () => {
@@ -311,7 +378,7 @@ describe("broker publish/consume/ack", () => {
     expect((await system.broker.getQueue("q")).unacked).toBe(1);
     expect((await system.broker.consume("q", { consumerId: "c2" })).messages).toHaveLength(0);
     // The hold settles normally.
-    await system.broker.ack("q", "msg_hold", "c1");
+    await system.broker.ack("q", "msg_hold");
     expect((await system.broker.getQueue("q")).unacked).toBe(0);
   });
 
@@ -333,8 +400,8 @@ describe("broker publish/consume/ack", () => {
     }
     expect((await system.broker.getQueue("q")).unacked).toBe(2);
     // With nothing leased, recovery reports zero.
-    await system.broker.ack("q", "msg_o1", "c2");
-    await system.broker.ack("q", "msg_o2", "c2");
+    await system.broker.ack("q", "msg_o1");
+    await system.broker.ack("q", "msg_o2");
     expect((await system.broker.requeueOrphanedLeases("q")).requeued).toBe(0);
     await expectCode(system.broker.requeueOrphanedLeases("missing"), "NOT_FOUND");
   });

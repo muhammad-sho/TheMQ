@@ -86,6 +86,22 @@ export interface ConsumeOptions {
   noExpiry?: boolean | undefined;
 }
 
+export interface RequeueOptions {
+  /** Replacement payload for the next delivery. */
+  data?: Json | undefined;
+  /** Delay before the message becomes available again (ms from now). */
+  ttlMs?: number | undefined;
+}
+
+export interface RequeuedMessage {
+  id: string;
+  queue: string;
+  requeued: boolean;
+  state: MessageState;
+  availableAt: number;
+  deliveries: number;
+}
+
 type ScriptCaller = (...args: Array<string | number>) => Promise<unknown>;
 
 /** Bounds for monitoring reads so fleet size never drives reply size. */
@@ -211,7 +227,7 @@ export class BrokerService {
     this.register("themqPublish", PUBLISH_SCRIPT, 5);
     this.register("themqConsume", CONSUME_SCRIPT, 7);
     this.register("themqAck", ACK_SCRIPT, 3);
-    this.register("themqRequeue", REQUEUE_SCRIPT, 4);
+    this.register("themqRequeue", REQUEUE_SCRIPT, 5);
     this.register("themqDeleteMessage", DELETE_MESSAGE_SCRIPT, 4);
     this.register("themqSetTtl", SET_TTL_SCRIPT, 4);
     this.register("themqCancelConsumer", CANCEL_CONSUMER_SCRIPT, 5);
@@ -593,7 +609,7 @@ export class BrokerService {
     return { consumerId, messages };
   }
 
-  async ack(queue: string, id: string, consumerId?: string): Promise<{ deliveries: number }> {
+  async ack(queue: string, id: string): Promise<{ deliveries: number }> {
     const keys = queueKeys(this.options.prefix, queue);
     let reply: unknown;
     try {
@@ -602,8 +618,6 @@ export class BrokerService {
         keys.unacked,
         messageKey(keys, id),
         id,
-        consumerId ?? "",
-        Date.now(),
         keys.pendingPrefix,
       ]);
     } catch (err) {
@@ -612,26 +626,39 @@ export class BrokerService {
     return { deliveries: this.settledLease(reply, "ack", queue, id, "ack") };
   }
 
-  async requeue(queue: string, id: string, consumerId?: string): Promise<{ deliveries: number }> {
+  async requeue(queue: string, id: string, opts: RequeueOptions = {}): Promise<RequeuedMessage> {
     const keys = queueKeys(this.options.prefix, queue);
+    const now = Date.now();
+    let dataJson = "";
+    if (opts.data !== undefined) {
+      dataJson = JSON.stringify(opts.data);
+      if (Buffer.byteLength(dataJson, "utf8") > this.options.maxMessageBytes) {
+        throw ApiError.validation(
+          `Message payload exceeds the ${String(this.options.maxMessageBytes)} byte limit.`,
+        );
+      }
+    }
+    const availableAt = now + (opts.ttlMs ?? 0);
     let reply: unknown;
     try {
       reply = await this.call("themqRequeue", [
         keys.meta,
         keys.ready,
+        keys.delayed,
         keys.unacked,
         messageKey(keys, id),
         id,
-        consumerId ?? "",
-        Date.now(),
+        now,
         keys.pendingPrefix,
+        dataJson,
+        availableAt,
       ]);
     } catch (err) {
       throw classifyBackendError(err, "requeue message");
     }
-    const deliveries = this.settledLease(reply, "requeue", queue, id, "requeue");
+    const settled = this.settledRequeue(reply, queue, id);
     this.notifyChanged(queue);
-    return { deliveries };
+    return settled;
   }
 
   private settledLease(
@@ -645,15 +672,36 @@ export class BrokerService {
     const status = asString(parts[0], script);
     if (status === "OK") return asNumber(parts[1], script);
     if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
-    if (status === "WRONG_OWNER") {
-      throw new ApiError("CONFLICT", `Message '${id}' is leased to another consumer.`, {
-        resource: { type: "message", id, queue },
-      });
-    }
     const state = asString(parts[1] ?? "", script);
     throw new ApiError(
       "CONFLICT",
       `Cannot ${verb} message '${id}' while it is ${state === "" ? "unavailable" : state}.`,
+      { resource: { type: "message", id, queue } },
+    );
+  }
+
+  private settledRequeue(reply: unknown, queue: string, id: string): RequeuedMessage {
+    const parts = asArray(reply, "requeue");
+    const status = asString(parts[0], "requeue");
+    if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
+    if (status === "OK") {
+      const state = asString(parts[2], "requeue");
+      if (!isMessageState(state) || (state !== "ready" && state !== "delayed")) {
+        throw ApiError.internal("Unexpected reply from requeue.");
+      }
+      return {
+        id,
+        queue,
+        requeued: true,
+        state,
+        availableAt: asNumber(parts[3], "requeue"),
+        deliveries: asNumber(parts[1], "requeue"),
+      };
+    }
+    const state = asString(parts[1] ?? "", "requeue");
+    throw new ApiError(
+      "CONFLICT",
+      `Cannot requeue message '${id}' while it is ${state === "" ? "unavailable" : state}.`,
       { resource: { type: "message", id, queue } },
     );
   }

@@ -214,9 +214,8 @@ return out
 /**
  * Acknowledge one leased message (removes it permanently).
  * KEYS: meta, unacked, msg
- * ARGV: id, consumerOrEmpty, now, pendPrefix
- * Returns {'OK', deliveries} | {'NOT_FOUND'} | {'CONFLICT', state} |
- *         {'WRONG_OWNER', owner}.
+ * ARGV: id, pendPrefix
+ * Returns {'OK', deliveries} | {'NOT_FOUND'} | {'CONFLICT', state}.
  */
 export const ACK_SCRIPT = `
 if redis.call('EXISTS', KEYS[3]) == 0 then
@@ -227,13 +226,10 @@ if state ~= 'unacked' then
   return {'CONFLICT', state or ''}
 end
 local owner = redis.call('HGET', KEYS[3], 'consumer')
-if ARGV[2] ~= '' and owner ~= ARGV[2] then
-  return {'WRONG_OWNER', owner or ''}
-end
 local deliveries = redis.call('HGET', KEYS[3], 'deliveries')
 redis.call('ZREM', KEYS[2], ARGV[1])
 if owner and owner ~= '' then
-  redis.call('SREM', ARGV[4] .. owner .. ':pending', ARGV[1])
+  redis.call('SREM', ARGV[2] .. owner .. ':pending', ARGV[1])
 end
 redis.call('DEL', KEYS[3])
 redis.call('HINCRBY', KEYS[1], 'acked', 1)
@@ -241,33 +237,43 @@ return {'OK', deliveries or '0'}
 `;
 
 /**
- * Requeue one leased message back to the ready tail.
- * KEYS: meta, ready, unacked, msg
- * ARGV: id, consumerOrEmpty, now, pendPrefix
- * Returns {'OK', deliveries} | {'NOT_FOUND'} | {'CONFLICT', state} |
- *         {'WRONG_OWNER', owner}.
+ * Requeue one leased message. Plain callers get today's tail requeue;
+ * passing data and/or a later availableAt requeues on those terms
+ * instead (same id, delivery count preserved for the next delivery).
+ * KEYS: meta, ready, delayed, unacked, msg
+ * ARGV: id, now, pendPrefix, dataOrEmpty, availableAt
+ * Returns {'OK', deliveries, next, availableAt} | {'NOT_FOUND'} |
+ *         {'CONFLICT', state}.
  */
 export const REQUEUE_SCRIPT = `
-if redis.call('EXISTS', KEYS[4]) == 0 then
+if redis.call('EXISTS', KEYS[5]) == 0 then
   return {'NOT_FOUND'}
 end
-local state = redis.call('HGET', KEYS[4], 'state')
+local state = redis.call('HGET', KEYS[5], 'state')
 if state ~= 'unacked' then
   return {'CONFLICT', state or ''}
 end
-local owner = redis.call('HGET', KEYS[4], 'consumer')
-if ARGV[2] ~= '' and owner ~= ARGV[2] then
-  return {'WRONG_OWNER', owner or ''}
-end
-local deliveries = redis.call('HGET', KEYS[4], 'deliveries')
-redis.call('ZREM', KEYS[3], ARGV[1])
+local owner = redis.call('HGET', KEYS[5], 'consumer')
+local deliveries = redis.call('HGET', KEYS[5], 'deliveries')
+redis.call('ZREM', KEYS[4], ARGV[1])
 if owner and owner ~= '' then
-  redis.call('SREM', ARGV[4] .. owner .. ':pending', ARGV[1])
+  redis.call('SREM', ARGV[3] .. owner .. ':pending', ARGV[1])
 end
-redis.call('HSET', KEYS[4], 'state', 'ready', 'consumer', '', 'visibleAt', 0, 'updatedAt', ARGV[3])
-redis.call('RPUSH', KEYS[2], ARGV[1])
+if ARGV[4] ~= '' then
+  redis.call('HSET', KEYS[5], 'data', ARGV[4])
+end
+local next
+if tonumber(ARGV[5]) <= tonumber(ARGV[2]) then
+  next = 'ready'
+  redis.call('RPUSH', KEYS[2], ARGV[1])
+else
+  next = 'delayed'
+  redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
+end
+redis.call('HSET', KEYS[5], 'state', next, 'consumer', '', 'visibleAt', 0,
+  'availableAt', ARGV[5], 'updatedAt', ARGV[2])
 redis.call('HINCRBY', KEYS[1], 'requeued', 1)
-return {'OK', deliveries or '0'}
+return {'OK', deliveries or '0', next, ARGV[5]}
 `;
 
 /**

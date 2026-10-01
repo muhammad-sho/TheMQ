@@ -228,15 +228,12 @@ describe("persistent consumers (WebSocket subscribe)", () => {
     ws.close();
   });
 
-  it("holds subscribed messages without a deadline, however short the hello lease", async () => {
+  it("holds subscribed messages without a deadline", async () => {
     await declareQueue("hold");
     const { ws, nextFrame } = openConsumer(base, "hold");
     await waitOpen(ws);
-    // 100ms is the shortest lease the hello schema accepts — the server
-    // must ignore it for persistent deliveries (RabbitMQ manual-ack style).
-    ws.send(
-      JSON.stringify({ action: "hello", consumerId: "c1", prefetch: 5, visibilityTimeoutMs: 100 }),
-    );
+    // Persistent deliveries carry no deadline (RabbitMQ manual-ack style).
+    ws.send(JSON.stringify({ action: "hello", consumerId: "c1", prefetch: 5 }));
     await nextFrame();
 
     const { id } = await publish("hold", { data: "patient" });
@@ -253,6 +250,43 @@ describe("persistent consumers (WebSocket subscribe)", () => {
 
     ws.send(JSON.stringify({ action: "ack", id }));
     await expect(nextFrame()).resolves.toMatchObject({ type: "acked", id, deliveries: 1 });
+    ws.close();
+  });
+
+  it("requeues over the socket with new payload and delay", async () => {
+    await declareQueue("terms");
+    const { ws, nextFrame } = openConsumer(base, "terms");
+    await waitOpen(ws);
+    ws.send(JSON.stringify({ action: "hello", consumerId: "c1", prefetch: 5 }));
+    await nextFrame();
+
+    const { id } = await publish("terms", { data: { v: 1 } });
+    const first = await nextFrame();
+    expect(first).toMatchObject({ id, deliveryCount: 1 });
+
+    ws.send(JSON.stringify({ action: "requeue", id, data: { v: 2 }, ttlMs: 400 }));
+    const requeued = await nextFrame();
+    expect(requeued).toMatchObject({ type: "requeued", id, state: "delayed", deliveries: 1 });
+
+    const second = await nextFrame(8000);
+    expect(second).toMatchObject({ id, data: { v: 2 }, deliveryCount: 2, redelivered: true });
+    ws.send(JSON.stringify({ action: "ack", id }));
+    await expect(nextFrame()).resolves.toMatchObject({ type: "acked", id, deliveries: 2 });
+    ws.close();
+  });
+
+  it("rejects requeue frames with invalid options", async () => {
+    await declareQueue("strict-rq");
+    const { ws, nextFrame } = openConsumer(base, "strict-rq");
+    await waitOpen(ws);
+    ws.send(JSON.stringify({ action: "hello", prefetch: 5 }));
+    await nextFrame();
+
+    const { id } = await publish("strict-rq", { data: 1 });
+    await nextFrame();
+    ws.send(JSON.stringify({ action: "requeue", id, ttlMs: -5 }));
+    await expect(nextFrame()).resolves.toMatchObject({ type: "error", code: "PROTOCOL_ERROR", id });
+    expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
   });
 

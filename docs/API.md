@@ -166,7 +166,7 @@ frame the moment a message becomes available — no polling.
 ```text
 Client →  { "action": "hello", "consumerId": "worker-1", "prefetch": 10 }
 Server →  { "type": "ready", "queue": "orders", "consumerId": "worker-1",
-            "prefetch": 10, "visibilityTimeoutMs": 30000 }
+            "prefetch": 10 }
 Server →  { "type": "message", "queue": "orders", "id": "msg_123",
             "consumerId": "worker-1", "data": {...},
             "deliveryCount": 1, "redelivered": false, "visibleAt": 0 }
@@ -176,13 +176,11 @@ Server →  { "type": "acked", "id": "msg_123", "deliveries": 1 }
 
 Deliveries are held RabbitMQ-style: **no visibility deadline**, so a
 message stays leased however long processing takes — it returns to the
-queue only when requeued, or when the connection drops. `visibleAt` is
-therefore `0` on subscribed messages.
+queue only when requeued (optionally on new terms), or when the
+connection drops. `visibleAt` is therefore `0` on subscribed messages.
 
 Hello fields: `consumerId` (optional, generated when omitted),
-`prefetch` (1–1000, default `DEFAULT_PREFETCH`). `visibilityTimeoutMs`
-(100–43200000) is still accepted for backward compatibility but no
-longer sets an expiry. The first frame
+`prefetch` (1–1000, default `DEFAULT_PREFETCH`). The first frame
 must be `hello` (10 s grace, then the socket closes with code `4400`).
 
 Client actions:
@@ -190,13 +188,13 @@ Client actions:
 | Action frame | Reply |
 | --- | --- |
 | `{ "action": "ack", "id" }` | `{ "type": "acked", "id", "deliveries" }` |
-| `{ "action": "requeue", "id" }` | `{ "type": "requeued", "id", "deliveries" }` |
+| `{ "action": "requeue", "id", "data"?, "ttlMs"? }` | `{ "type": "requeued", "id", "queue", "requeued", "state", "availableAt", "deliveries" }` |
 | `{ "action": "cancel" }` | `{ "type": "cancelled", "requeued" }`, then close `1000` |
 
 Violations and settle failures arrive as
 `{ "type": "error", "code", "message", "id"? }` and never close the socket.
-Settling a message that is not leased (or is owned by someone else)
-reports `CONFLICT`, exactly like the HTTP endpoints.
+Settling a message that is not leased reports `CONFLICT`, exactly like
+the HTTP endpoints.
 
 Lifecycle:
 
@@ -220,22 +218,22 @@ messages per consumer through the same atomic path as HTTP consume.
 ```bash
 curl -s -X POST localhost:3000/queues/orders/messages/msg_123/ack \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"consumerId":"worker-1"}'
+  -d '{}'
 
 curl -s -X POST localhost:3000/queues/orders/messages/msg_123/requeue \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"consumerId":"worker-1"}'
+  -d '{"data":{"attempt":2},"ttlMs":60000}'
 ```
 
 - Ack removes the message permanently (`{id, queue, acked: true,
-  deliveries}`).
-- Requeue returns a leased message to the ready tail (`{id, queue,
-  requeued: true, state: "ready", deliveries}`); the next delivery has an
+  deliveries}`). Queue + id identify the message; no owner needed.
+- Requeue is for leased messages (picked up but unacked): plain `{}` returns
+  it to the ready tail with its original details; `data` replaces the payload
+  and `ttlMs` delays redelivery (`{id, queue, requeued: true, state,
+  availableAt, deliveries}`). The next delivery keeps the same id with an
   incremented `deliveryCount` and `redelivered: true`.
-- Only leased (`unacked`) messages can be settled — otherwise `409`. A
-  mismatched `consumerId` also returns `409`.
-- `consumerId` is optional; supply it to stop one consumer from settling
-  another's leases.
+- Only leased (`unacked`) messages can be settled — otherwise `409`.
+  Waiting messages (never picked up) are edited with upsert instead.
 
 ## Delete a queued message
 
