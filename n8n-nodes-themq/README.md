@@ -1,5 +1,8 @@
 # n8n-nodes-themq
 
+[![npm version](https://img.shields.io/npm/v/n8n-nodes-themq.svg)](https://www.npmjs.com/package/n8n-nodes-themq)
+[![license](https://img.shields.io/badge/license-ISC-blue.svg)](../LICENSE)
+
 Native n8n community nodes for [TheMQ](https://github.com/muhammad-sho/TheMQ) — a lightweight,
 Redis-backed message broker built around queues and consumers.
 
@@ -168,6 +171,12 @@ Drop a queued message before it is ever delivered:
 TheMQ → Delete Message
 ```
 
+Send a delivered message back with new data, a delay, or both:
+
+```text
+TheMQ → Requeue
+```
+
 ## Development
 
 ```bash
@@ -178,22 +187,6 @@ npm run format
 npm run build        # tsc -> dist/ (+ icons)
 ```
 
-## Publish
+## License
 
-Releases are published to npm by the [`publish-n8n`
-workflow](https://github.com/muhammad-sho/TheMQ/blob/main/.github/workflows/publish-n8n.yml),
-which uses the `NPM_TOKEN` repository secret:
-
-```bash
-npm version patch|minor|major   # bumps n8n-nodes-themq/package.json
-git push origin main
-git tag n8n-nodes-themq-v0.5.0  # must match package.json
-git push origin n8n-nodes-themq-v0.5.0
-```
-
-Pushing the tag builds, verifies, and runs `npm publish --access public`.
-Manual publish (needs an npm token with 2FA bypass or `--otp`):
-
-```bash
-npm publish --access public
-```
+ISC — see [LICENSE](../LICENSE).

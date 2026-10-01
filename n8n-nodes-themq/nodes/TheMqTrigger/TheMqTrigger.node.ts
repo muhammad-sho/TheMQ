@@ -610,6 +610,18 @@ export class TheMqTrigger implements INodeType {
     /** Re-establish the consumer after a drop; back off while unreachable. */
     const establish = async (): Promise<void> => {
       const early = await connectConsumer(prefetch, true);
+      if (closeRequested) {
+        // Deactivated mid-handshake: drop the fresh connection at once
+        // instead of leaking a live consumer nobody reads from.
+        const current = socket;
+        socket = undefined;
+        try {
+          current?.close(WS_NORMAL_CLOSE, "Trigger deactivated");
+        } catch {
+          // ignore — socket is already gone
+        }
+        return;
+      }
       reconnectDelayMs = RECONNECT_INITIAL_MS;
       for (const message of early) {
         void handleMessage(message);
@@ -625,6 +637,7 @@ export class TheMqTrigger implements INodeType {
         reconnectTimer = undefined;
         if (closeRequested) return;
         establish().catch((error: unknown) => {
+          if (closeRequested) return;
           const message = error instanceof Error ? error.message : String(error);
           if (isFatalConnectionError(error)) {
             this.emitError(new Error(message));

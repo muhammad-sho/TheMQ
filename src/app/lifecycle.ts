@@ -1,5 +1,29 @@
 import type { AppConfig } from "../config/schema.js";
+import type { BrokerService } from "../broker/broker.js";
+import type { Logger } from "../infrastructure/logging/logger.js";
 import { buildSystem, type BuiltSystem } from "./build-app.js";
+
+/**
+ * Requeue every lease orphaned by the previous run. Only safe at startup:
+ * no consumer can be live yet, so each leased message is treated as if
+ * its holder disconnected at once (RabbitMQ-restart style). Returns the
+ * total requeued. Exported for tests; production calls it from `run`.
+ */
+export async function recoverOrphanedLeases(
+  broker: BrokerService,
+  logger: Logger,
+): Promise<number> {
+  const queues = await broker.knownQueues();
+  let recovered = 0;
+  for (const queue of queues) {
+    const { requeued } = await broker.requeueOrphanedLeases(queue);
+    recovered += requeued;
+  }
+  if (recovered > 0) {
+    logger.info({ event: "orphans-recovered", requeued: recovered }, "Recovered orphaned leases");
+  }
+  return recovered;
+}
 
 /**
  * Start the broker and wait for SIGTERM/SIGINT.
@@ -26,17 +50,8 @@ export async function run(config: AppConfig): Promise<void> {
       { event: "api-listening", host: config.apiHost, port: config.apiPort },
       "TheMQ API listening",
     );
-    // No consumer can be live yet, so every leased message is an orphan
-    // of the previous run: requeue it before the sweeper starts.
-    const queues = await broker.knownQueues();
-    let recovered = 0;
-    for (const queue of queues) {
-      const { requeued } = await broker.requeueOrphanedLeases(queue);
-      recovered += requeued;
-    }
-    if (recovered > 0) {
-      logger.info({ event: "orphans-recovered", requeued: recovered }, "Recovered orphaned leases");
-    }
+    // No consumer can be live yet: recover orphans before serving.
+    await recoverOrphanedLeases(broker, logger);
     system.sweeper.start();
     logger.info({ event: "started" }, "TheMQ started");
 

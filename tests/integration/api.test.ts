@@ -281,6 +281,55 @@ describe("broker HTTP API", () => {
   });
 });
 
+describe("broker HTTP limits", () => {
+  async function startWith(
+    env: Record<string, string>,
+  ): Promise<{ system: BuiltSystem; base: string }> {
+    const config = testConfig(uniquePrefix("limits"), { API_PORT: "0", ...env });
+    const system = await buildSystem(config);
+    await system.fastifyApp.listen({ host: "127.0.0.1", port: 0 });
+    return { system, base: `http://127.0.0.1:${String(portOf(system))}` };
+  }
+
+  it("enforces the per-client rate limit", async () => {
+    const { system, base } = await startWith({ RATE_LIMIT_MAX_PER_MINUTE: "3" });
+    try {
+      await fetch(`${base}/queues/rl`, { method: "PUT" });
+      const publish = (): Promise<Response> =>
+        fetch(`${base}/queues/rl/messages`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ id: `m${String(Math.random())}`, data: 1 }),
+        });
+      await publish();
+      await publish();
+      const limited = await publish();
+      expect(limited.status).toBe(429);
+      expect(await limited.json()).toMatchObject({ error: { code: "VALIDATION_ERROR" } });
+    } finally {
+      await system.close();
+    }
+  });
+
+  it("caps request bodies at MAX_MESSAGE_BYTES", async () => {
+    const { system, base } = await startWith({ MAX_MESSAGE_BYTES: "2048" });
+    try {
+      await fetch(`${base}/queues/big`, { method: "PUT" });
+      const res = await fetch(`${base}/queues/big/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: "too-big", data: "x".repeat(4096) }),
+      });
+      // 413 (not the broker 400): the HTTP body cap fired first, proving
+      // the MAX_MESSAGE_BYTES wiring holds end to end.
+      expect(res.status).toBe(413);
+      expect(await res.json()).toMatchObject({ error: { code: "VALIDATION_ERROR" } });
+    } finally {
+      await system.close();
+    }
+  });
+});
+
 describe("broker HTTP auth", () => {
   let system: BuiltSystem;
   let base: string;

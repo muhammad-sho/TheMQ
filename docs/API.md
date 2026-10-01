@@ -39,10 +39,11 @@ messages with these fields:
 ```
 
 - `state` — `ready` (waiting), `delayed` (hidden until `availableAt`),
-  `unacked` (leased to `consumerId` until `visibleAt`).
+  `unacked` (leased to `consumerId`; `visibleAt` is the REST lease deadline,
+  `0` for deadline-free subscribed holds).
 - `deliveryCount` — how many times the message was delivered;
   `redelivered` (`true` when delivered before) appears on consume output.
-- `consumerId` — lease owner, `null` unless `unacked`.
+- `consumerId` — current holder, `null` unless `unacked`.
 
 ## Errors
 
@@ -52,14 +53,14 @@ Failures return a stable body, never backend internals:
 { "error": { "code": "NOT_FOUND", "message": "queue 'x' not found." } }
 ```
 
-| Code | HTTP | Meaning |
-| --- | --- | --- |
-| `VALIDATION_ERROR` | 400 | Invalid input (schemas are strict; malformed JSON bodies map here too) |
-| `UNAUTHENTICATED` | 401 | Missing or invalid Bearer token |
-| `NOT_FOUND` | 404 | Unknown queue, message, or route |
-| `CONFLICT` | 409 | Message is not leased (or is leased to another consumer) |
-| `SERVICE_UNAVAILABLE` | 503 | Redis unreachable |
-| `INTERNAL_ERROR` | 500 | Unexpected failure |
+| Code                  | HTTP | Meaning                                                                          |
+| --------------------- | ---- | -------------------------------------------------------------------------------- |
+| `VALIDATION_ERROR`    | 400  | Invalid input (schemas are strict; malformed JSON bodies map here too)           |
+| `UNAUTHENTICATED`     | 401  | Missing or invalid Bearer token                                                  |
+| `NOT_FOUND`           | 404  | Unknown queue, message, or route                                                 |
+| `CONFLICT`            | 409  | Message is not in the required state (e.g. settling a message that isn't leased) |
+| `SERVICE_UNAVAILABLE` | 503  | Redis unreachable                                                                |
+| `INTERNAL_ERROR`      | 500  | Unexpected failure                                                               |
 
 ## Queues
 
@@ -108,7 +109,7 @@ default `false`), `onConflict` (optional `"error"` or `"skip"`, default
 `"error"`).
 
 - New id → `201 Created`: `{id, queue, state, availableAt, createdAt,
-  upserted: false, skipped: false, deliveryCount: 0}`.
+upserted: false, skipped: false, deliveryCount: 0}`.
 - Existing id without `upsert` → `409 CONFLICT`.
 - Existing id with `"upsert": true` → `200 OK` with `upserted: true`: the
   message is updated in place with the new data and TTL, as if freshly
@@ -144,8 +145,8 @@ Response: `{consumerId, messages: [{id, queue, data, deliveryCount,
 redelivered, visibleAt}]}`. Consuming an unknown queue → `404` (declare or
 publish first).
 
-- `consumerId` (optional, generated when empty) — lease owner used for
-  prefetch accounting, ack ownership checks, and cancellation.
+- `consumerId` (optional, generated when empty) — identifies the consumer
+  for prefetch accounting and cancellation.
 - `count` (default 1, capped by `MAX_CONSUME_COUNT`) — bounds this call.
 - `visibilityTimeoutMs` (default `DEFAULT_VISIBILITY_TIMEOUT_MS`) — the
   per-message lease; ack within it or the message is redelivered.
@@ -185,11 +186,11 @@ must be `hello` (10 s grace, then the socket closes with code `4400`).
 
 Client actions:
 
-| Action frame | Reply |
-| --- | --- |
-| `{ "action": "ack", "id" }` | `{ "type": "acked", "id", "deliveries" }` |
+| Action frame                                       | Reply                                                                                     |
+| -------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `{ "action": "ack", "id" }`                        | `{ "type": "acked", "id", "deliveries" }`                                                 |
 | `{ "action": "requeue", "id", "data"?, "ttlMs"? }` | `{ "type": "requeued", "id", "queue", "requeued", "state", "availableAt", "deliveries" }` |
-| `{ "action": "cancel" }` | `{ "type": "cancelled", "requeued" }`, then close `1000` |
+| `{ "action": "cancel" }`                           | `{ "type": "cancelled", "requeued" }`, then close `1000`                                  |
 
 Violations and settle failures arrive as
 `{ "type": "error", "code", "message", "id"? }` and never close the socket.
@@ -226,11 +227,11 @@ curl -s -X POST localhost:3000/queues/orders/messages/msg_123/requeue \
 ```
 
 - Ack removes the message permanently (`{id, queue, acked: true,
-  deliveries}`). Queue + id identify the message; no owner needed.
+deliveries}`). Queue + id identify the message; no owner needed.
 - Requeue is for leased messages (picked up but unacked): plain `{}` returns
   it to the ready tail with its original details; `data` replaces the payload
   and `ttlMs` delays redelivery (`{id, queue, requeued: true, state,
-  availableAt, deliveries}`). The next delivery keeps the same id with an
+availableAt, deliveries}`). The next delivery keeps the same id with an
   incremented `deliveryCount` and `redelivered: true`.
 - Only leased (`unacked`) messages can be settled — otherwise `409`.
   Waiting messages (never picked up) are edited with upsert instead.
