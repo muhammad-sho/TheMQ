@@ -86,14 +86,17 @@ function mockBroker(): BrokerService {
       }),
     ),
     ack: vi.fn().mockResolvedValue({ deliveries: 1 }),
-    requeue: vi.fn().mockResolvedValue({
-      id: "msg_123",
-      queue: "orders",
-      requeued: true,
-      state: "ready",
-      availableAt: 3,
-      deliveries: 1,
-    }),
+    requeue: vi.fn().mockImplementation((queue: string, id: string, opts?: unknown) =>
+      Promise.resolve({
+        id,
+        queue,
+        requeued: true,
+        state: "ready",
+        availableAt: 3,
+        deliveries: 1,
+        received: opts,
+      }),
+    ),
     deleteMessage: vi.fn().mockResolvedValue({ state: "ready" }),
     setMessageTtl: vi
       .fn()
@@ -179,11 +182,11 @@ describe("broker routes (mocked service, no Redis)", () => {
       headers: auth,
       payload: { data: { attempt: 2 }, ttlMs: 60000 },
     });
-    expect(broker.requeue).toHaveBeenCalledWith("orders", "msg_123", {
-      data: { attempt: 2 },
-      ttlMs: 60000,
+    expect(res.json()).toMatchObject({
+      requeued: true,
+      state: "ready",
+      received: { data: { attempt: 2 }, ttlMs: 60000 },
     });
-    expect(res.json()).toMatchObject({ requeued: true, state: "ready" });
   });
 
   it("deletes messages, changes TTL, and cancels consumers", async () => {

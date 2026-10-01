@@ -328,7 +328,7 @@ describe("broker publish/consume/ack", () => {
       async () => {
         const found = await system.broker.consume("q", { consumerId: "c2" });
         if (found.messages.length === 1) {
-          redelivered = found.messages[0] as { id: string; data: unknown };
+          redelivered = found.messages[0];
           return true;
         }
         return false;
