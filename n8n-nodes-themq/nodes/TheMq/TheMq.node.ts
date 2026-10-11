@@ -335,7 +335,15 @@ function encode(value: string): string {
 /** TheMQ error code from a formatted node error (undefined = transport/unknown). */
 function apiCodeOf(error: unknown): string | undefined {
   const message = error instanceof Error ? error.message : String(error);
-  return /TheMQ ([A-Z_]+):/.exec(message)?.[1];
+  const named = /TheMQ ([A-Z_]+):/.exec(message)?.[1];
+  if (named !== undefined && named !== "HTTP") return named;
+  // n8n versions differ in how much of the API body survives on the
+  // error object; when only the status text remains ("TheMQ HTTP 404:
+  // ..."), map the status back to its stable code.
+  const status = /TheMQ HTTP (\d+)/.exec(message)?.[1];
+  if (status === "404") return "NOT_FOUND";
+  if (status === "409") return "CONFLICT";
+  return undefined;
 }
 
 /** GET a message; undefined when it does not exist. Other failures throw. */
