@@ -72,7 +72,7 @@ export class TheMq implements INodeType {
             name: "Requeue",
             value: "requeue",
             description:
-              "Return a leased message to the queue, optionally with a new payload and delay",
+              "Ensure a message is queued: requeues it when leased, updates it when waiting, publishes it when missing",
             action: "Requeue a message",
           },
           {
@@ -99,7 +99,7 @@ export class TheMq implements INodeType {
         default: "={{ $json.messageId }}",
         required: true,
         description:
-          "Unique id of the message. When publishing this is the upsert key; when acknowledging or deleting it is taken from the trigger item when connected.",
+          "Unique id of the message. When publishing this is the upsert key; when acknowledging, requeueing, or deleting it is taken from the trigger item when connected.",
       },
       {
         displayName: "Message Data",
@@ -247,32 +247,58 @@ export class TheMq implements INodeType {
             messageData?: unknown;
             ttlMs?: number;
           };
-          const body: Record<string, unknown> = {};
+          let replacement: unknown;
+          let hasReplacement = false;
           if (options.messageData !== undefined) {
             const dataParam: unknown = options.messageData;
             if (typeof dataParam === "string") {
               try {
-                body["data"] = JSON.parse(dataParam) as unknown;
+                replacement = JSON.parse(dataParam) as unknown;
               } catch {
                 throw new NodeOperationError(this.getNode(), "Message Data is not valid JSON.", {
                   itemIndex: i,
                 });
               }
             } else {
-              body["data"] = dataParam;
+              replacement = dataParam;
             }
+            hasReplacement = true;
           }
-          if (typeof options.ttlMs === "number" && options.ttlMs > 0) {
-            body["ttlMs"] = Math.floor(options.ttlMs);
+          const delayMs =
+            typeof options.ttlMs === "number" && options.ttlMs > 0
+              ? Math.floor(options.ttlMs)
+              : undefined;
+          const requeueBody: Record<string, unknown> = {
+            ...(hasReplacement ? { data: replacement } : {}),
+            ...(delayMs !== undefined ? { ttlMs: delayMs } : {}),
+          };
+          const requeuePath = `/queues/${encode(queue)}/messages/${encode(messageId)}/requeue`;
+          const requestContext = { itemIndex: i, operation, queue, messageId };
+          try {
+            const response = await request.call(this, "POST", requeuePath, requeueBody, {
+              ...requestContext,
+            });
+            returnData.push({ json: toDataObject(response) });
+          } catch (requeueError) {
+            // Forgiving requeue: the fast path above covers the normal
+            // leased case in one call. Anything else (already waiting,
+            // never published) is resolved into "queued" instead of
+            // surfacing a state error.
+            const ensured = await ensureQueued(
+              this,
+              queue,
+              messageId,
+              hasReplacement ? replacement : undefined,
+              hasReplacement,
+              delayMs,
+              toDataObject(items[i]?.json ?? {}),
+              requeueBody,
+              requeuePath,
+              requestContext,
+              requeueError,
+            );
+            returnData.push({ json: ensured });
           }
-          const response = await request.call(
-            this,
-            "POST",
-            `/queues/${encode(queue)}/messages/${encode(messageId)}/requeue`,
-            body,
-            { itemIndex: i, operation, queue, messageId },
-          );
-          returnData.push({ json: toDataObject(response) });
         } else if (operation === "delete") {
           await request.call(
             this,
@@ -304,6 +330,163 @@ export class TheMq implements INodeType {
 
 function encode(value: string): string {
   return encodeURIComponent(value);
+}
+
+/** TheMQ error code from a formatted node error (undefined = transport/unknown). */
+function apiCodeOf(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : String(error);
+  return /TheMQ ([A-Z_]+):/.exec(message)?.[1];
+}
+
+/** GET a message; undefined when it does not exist. Other failures throw. */
+async function fetchMessage(
+  context: IExecuteFunctions,
+  queue: string,
+  messageId: string,
+  requestContext: RequestContext,
+): Promise<IDataObject | undefined> {
+  try {
+    return toDataObject(
+      await request.call(
+        context,
+        "GET",
+        `/queues/${encode(queue)}/messages/${encode(messageId)}`,
+        undefined,
+        { ...requestContext },
+      ),
+    );
+  } catch (error) {
+    if (apiCodeOf(error) === "NOT_FOUND") return undefined;
+    throw error;
+  }
+}
+
+/**
+ * Resolve a failed requeue into "queued". Only NOT_FOUND/CONFLICT enter
+ * here; anything else (auth, transport, validation) rethrows at once.
+ * At most one state-changing retry follows the GET, so races settle
+ * instead of looping.
+ */
+async function ensureQueued(
+  context: IExecuteFunctions,
+  queue: string,
+  messageId: string,
+  replacement: unknown,
+  hasReplacement: boolean,
+  delayMs: number | undefined,
+  itemJson: IDataObject,
+  requeueBody: Record<string, unknown>,
+  requeuePath: string,
+  requestContext: RequestContext,
+  requeueError: unknown,
+): Promise<IDataObject> {
+  const code = apiCodeOf(requeueError);
+  if (code !== "NOT_FOUND" && code !== "CONFLICT") throw requeueError;
+  const current = await fetchMessage(context, queue, messageId, requestContext);
+  if (current === undefined) {
+    // Never published (or already gone): publish it. The trigger item
+    // carries the original payload, so workflows that requeue a
+    // trigger-delivered id without explicit data still work.
+    const payload = hasReplacement ? replacement : itemJson["data"];
+    if (payload === undefined) {
+      throw new NodeOperationError(
+        context.getNode(),
+        `TheMQ NOT_FOUND: message "${messageId}" does not exist in queue "${queue}" and no replacement payload was provided. Add Message Data to the Requeue Options to create it.`,
+        { itemIndex: requestContext.itemIndex },
+      );
+    }
+    try {
+      const published = await request.call(
+        context,
+        "POST",
+        `/queues/${encode(queue)}/messages`,
+        {
+          id: messageId,
+          data: payload,
+          ...(delayMs !== undefined ? { ttlMs: delayMs } : {}),
+          // Tolerate a race that created the message after the GET.
+          upsert: true,
+        },
+        { ...requestContext },
+      );
+      return { ...toDataObject(published), queued: true };
+    } catch (publishError) {
+      if (apiCodeOf(publishError) === "CONFLICT") {
+        // Lost the race: the message is leased now, so the requeue
+        // that just failed will succeed on the new terms.
+        return toDataObject(
+          await request.call(context, "POST", requeuePath, requeueBody, {
+            ...requestContext,
+          }),
+        );
+      }
+      throw publishError;
+    }
+  }
+  if (current["state"] === "unacked") {
+    // Changed under us between the requeue and the GET: one retry on
+    // the current terms instead of reporting a stale state.
+    return toDataObject(
+      await request.call(context, "POST", requeuePath, requeueBody, {
+        ...requestContext,
+      }),
+    );
+  }
+  // Already waiting (ready/delayed): success without moving it, unless
+  // new terms were given.
+  if (!hasReplacement && delayMs === undefined) {
+    return {
+      queue,
+      messageId,
+      requeued: false,
+      alreadyQueued: true,
+      state: current["state"],
+      availableAt: current["availableAt"],
+      deliveryCount: current["deliveryCount"],
+      // Raw payload passthrough (arbitrary JSON, not necessarily an object).
+      data: current["data"],
+    };
+  }
+  if (hasReplacement) {
+    // Waiting messages hold no lease, so upsert is the data path; it
+    // resets the delivery count, which is 0 for never-delivered work.
+    try {
+      const published = await request.call(
+        context,
+        "POST",
+        `/queues/${encode(queue)}/messages`,
+        {
+          id: messageId,
+          data: replacement,
+          ...(delayMs !== undefined ? { ttlMs: delayMs } : {}),
+          upsert: true,
+        },
+        { ...requestContext },
+      );
+      return { ...toDataObject(published), alreadyQueued: true };
+    } catch (publishError) {
+      if (apiCodeOf(publishError) === "CONFLICT") {
+        // Leased between the GET and the publish: requeue on the new
+        // terms once instead of failing.
+        return toDataObject(
+          await request.call(context, "POST", requeuePath, requeueBody, {
+            ...requestContext,
+          }),
+        );
+      }
+      throw publishError;
+    }
+  }
+  // Delay-only: the TTL endpoint moves the message without touching
+  // the payload or the delivery count.
+  const moved = await request.call(
+    context,
+    "PUT",
+    `/queues/${encode(queue)}/messages/${encode(messageId)}/ttl`,
+    { ttl: delayMs },
+    { ...requestContext },
+  );
+  return { queue, messageId, requeued: false, alreadyQueued: true, ...toDataObject(moved) };
 }
 
 /** Strip trailing slashes so `baseUrl + path` never doubles them. */
@@ -365,7 +548,7 @@ function hintForCode(code: string, operation: string, message: string): string {
         return "The message is not leased. It may already be settled, or never picked up yet.";
       }
       if (operation === "requeue") {
-        return "Only leased messages (picked up but unacked) can be requeued. Waiting messages are edited with upsert instead.";
+        return "The message could not be returned to the queue. It may have been settled concurrently — run the node again.";
       }
       return "The message is leased (unacked). Acknowledge it first.";
     case "SERVICE_UNAVAILABLE":

@@ -128,12 +128,14 @@ Publish · Acknowledge · Requeue · Delete Message
 - **Acknowledge** — marks a trigger-delivered message as successfully
   processed. Queue and Message ID default to the trigger item, so no
   wiring is needed.
-- **Requeue** — returns a leased message (picked up but unacked) to the
-  queue. Queue and Message ID default to the trigger item; the optional
-  Options (+) take a replacement Message Data and a Delay before it
-  becomes available again. Empty options requeue with the original
-  details. Waiting messages (never picked up) are edited with Upsert
-  publish instead.
+- **Requeue** — ensures a message ends up queued, whatever state it is
+  in. Leased messages (picked up but unacked) are requeued; messages
+  still waiting are left in place (or updated when Options carry new
+  terms); missing messages are published (needs Message Data in
+  Options, or a trigger item carrying the payload). Queue and Message
+  ID default to the trigger item; the optional Options (+) take a
+  replacement Message Data and a Delay before it becomes available
+  again. Empty options requeue with the original details.
 - **Delete Message** — removes a waiting message so it is never
   processed. Queue and Message ID default to the trigger item.
 
