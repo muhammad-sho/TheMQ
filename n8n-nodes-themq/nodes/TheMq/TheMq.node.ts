@@ -424,8 +424,10 @@ async function ensureQueued(
     );
   }
   // Already waiting (ready/delayed): success without moving it, unless
-  // new terms were given.
-  if (!hasReplacement && delayMs === undefined) {
+  // replacement data or a real delay was given. Zero only promotes a
+  // delayed message; an already-ready message stays where it is.
+  const readyAlready = delayMs === 0 && current["state"] === "ready";
+  if (!hasReplacement && (delayMs === undefined || readyAlready)) {
     return {
       queue,
       messageId,

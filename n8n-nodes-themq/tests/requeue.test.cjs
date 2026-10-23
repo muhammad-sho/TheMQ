@@ -53,7 +53,7 @@ function nodeContext(options, behavior = {}) {
               id: "msg_test",
               queue: "q",
               data: { v: 1 },
-              state: "delayed",
+              state: behavior.state ?? "delayed",
               availableAt: 123,
               deliveryCount: 0,
             };
@@ -138,6 +138,36 @@ test("requeue with ttlMs 0 retries when a consumer leases during the TTL update"
       ["GET", "/queues/q/messages/msg_test", undefined],
       ["PUT", "/queues/q/messages/msg_test/ttl", { ttl: 0 }],
       ["POST", "/queues/q/messages/msg_test/requeue", { ttlMs: 0 }],
+    ],
+  );
+});
+
+test("requeue with ttlMs 0 leaves an already-ready message in place", async () => {
+  const context = nodeContext({ ttlMs: 0 }, { state: "ready" });
+  const result = await new TheMq().execute.call(context);
+
+  assert.deepEqual(result, [
+    [
+      {
+        json: {
+          queue: "q",
+          messageId: "msg_test",
+          requeued: false,
+          alreadyQueued: true,
+          state: "ready",
+          availableAt: 123,
+          deliveryCount: 0,
+          data: { v: 1 },
+        },
+      },
+    ],
+  ]);
+
+  assert.deepEqual(
+    context.calls.map((call) => [call.method, call.url]),
+    [
+      ["POST", "/queues/q/messages/msg_test/requeue"],
+      ["GET", "/queues/q/messages/msg_test"],
     ],
   );
 });
