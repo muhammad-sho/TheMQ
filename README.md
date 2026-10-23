@@ -4,139 +4,188 @@
 [![npm version](https://img.shields.io/npm/v/n8n-nodes-themq.svg)](https://www.npmjs.com/package/n8n-nodes-themq)
 [![license](https://img.shields.io/badge/license-ISC-blue.svg)](LICENSE)
 
-A lightweight, Redis-backed message broker that holds work in queues until
-your tools finish it — even across restarts. Publish a message, a worker
-leases it, and it comes back automatically unless acknowledged. Nothing is
-lost silently.
+A durable, Redis-backed message queue for work you cannot afford to lose.
+Publish a message, let a worker pick it up, and TheMQ keeps it until the work
+is acknowledged — across restarts, crashes, and delayed jobs.
 
-Native n8n nodes are included, and the JSON HTTP/WebSocket API works with
-anything else.
+Native [n8n](https://n8n.io) nodes are included. The JSON HTTP and WebSocket
+APIs work with any language or framework.
 
-## How it works
+[About](#about) · [Install](#install) · [Use with n8n](#use-with-n8n) · [API and integrations](#api-and-integrations) · [License](#license)
 
-1. **Publish** a message with a stable `id`.
-2. **Consume** it; the broker leases the message to a worker.
-3. **Acknowledge** it when done, or **requeue** it / let the lease expire to
-   retry.
+## About
 
-Delivery is at-least-once, so make consumers idempotent.
+TheMQ is a small, self-hosted message broker for background work that must
+finish, not disappear. Your app publishes a message with an id; a worker
+receives it and acknowledges it when the job is done. If the worker fails,
+disconnects, or the server restarts, the message comes back.
 
-## Features
-
-- **At-least-once delivery** — unacknowledged messages are redelivered with
-  `redelivered: true` and a `deliveryCount`, so retries stay visible.
-- **Manual-ack holds** — persistent consumers hold messages with no deadline
-  until they ack, requeue, or disconnect (RabbitMQ-style).
-- **Requeue on your terms** — return a message with a new payload and/or a
-  delay, under the same id.
-- **Upsert + skip-on-conflict publishing** — update in place, or treat a
-  duplicate id as state instead of an error.
-- **Delayed messages** — per-message TTL before first availability.
-- **Competing consumers** with server-side prefetch caps.
-- **n8n nodes** — trigger + actions with reconnect and execution-aware ack
-  modes.
-- **One container + Redis** — small Docker image, JSON logs, health probes.
-
-## Quickstart
-
-**Requirements:** Docker with the Compose plugin, and `curl` for the examples
-below.
-
-### 1. Start the broker
-
-```bash
-git clone https://github.com/muhammad-sho/TheMQ.git
-cd TheMQ
-
-# Pick a long random secret and keep it for the next steps.
-export API_TOKEN="$(openssl rand -hex 32)"
-
-docker compose up -d --wait
-curl -fsS localhost:3000/health/ready
+```text
+Publisher ──▶ TheMQ queue ──▶ Worker ──▶ Acknowledge
+                   │
+                   └── no ack / crash ──▶ redelivered
 ```
 
-`health/ready` returns `200` when TheMQ and Redis are ready. The `API_TOKEN`
-above is passed into the container by Compose. The fallback token in
-`docker-compose.yml` is for local testing only — set your own before exposing
-port 3000.
+It is a good fit for:
 
-Messages persist in `./data/redis`; back up that folder to back up your queues.
+- background jobs and internal automation
+- webhooks and event handoff between services
+- delayed or scheduled tasks
+- reliable n8n workflows
+- multiple workers sharing one queue
 
-### 2. Publish a message
+### Features
+
+- **Reliable by default** — messages live in Redis and survive restarts.
+- **Automatic retries** — unacknowledged work is redelivered, with
+  `redelivered` and `deliveryCount` so retries stay visible.
+- **Long-running jobs** — persistent consumers (n8n or WebSocket) hold a
+  message with no deadline until they acknowledge it.
+- **Retry with context** — requeue the same message with new data and/or a
+  delay.
+- **Delayed jobs** — hide a message for a chosen delay.
+- **Safe parallel workers** — competing consumers each get different messages,
+  with limits on how much work each holds at once.
+- **Stable ids** — publish the same id with upsert, or skip conflicts instead
+  of failing.
+- **n8n native** — trigger and action nodes, with no HTTP glue required.
+- **Easy to operate** — one app container plus Redis, JSON logs, and health
+  endpoints.
+
+## Install
+
+TheMQ runs as one application container beside Redis. Create a
+`docker-compose.yml` from this file; it publishes port `3000`, stores Redis
+data in `./data/redis`, and pins an API token for clients.
+
+```yaml
+services:
+  themq:
+    image: ghcr.io/muhammad-sho/themq:latest
+    container_name: themq
+    hostname: themq
+    restart: unless-stopped
+    depends_on:
+      - redis
+    ports:
+      - "${API_PORT:-3000}:3000"
+    environment:
+      # API token used by clients and the n8n credential.
+      # Change this before exposing TheMQ outside localhost.
+      API_TOKEN: ${API_TOKEN:-VoUZ9gJutnb8WEKyAYS5m2yVViEVb6L3aOzWMEtEuSo}
+      # The image defaults to this Compose service name.
+      REDIS_URL: redis://redis:6379
+
+  redis:
+    image: redis:7-alpine
+    container_name: themq-redis
+    hostname: themq-redis
+    restart: unless-stopped
+    volumes:
+      - ./data/redis:/data
+```
+
+Before exposing TheMQ beyond localhost, change `API_TOKEN` to your own long
+random value. Use that same value in API requests and in the n8n credential.
+
+For optional environment overrides and production guidance, see
+[Configuration](docs/configuration.md) and [Deployment](docs/deployment.md).
+
+## Use with n8n
+
+TheMQ ships a native community node package:
+[`n8n-nodes-themq`](n8n-nodes-themq/README.md). It adds two nodes:
+
+| Node              | What it does                                                            |
+| ----------------- | ----------------------------------------------------------------------- |
+| **TheMQ Trigger** | Starts one workflow execution per message over a persistent connection. |
+| **TheMQ**         | Publishes, acknowledges, requeues, or deletes messages.                 |
+
+### Install the community node
+
+1. In n8n, open **Settings → Community Nodes**.
+2. Select **Install**, enter `n8n-nodes-themq`, and confirm.
+3. Restart n8n if your installation requires it.
+4. Create a **TheMQ API** credential with:
+   - **Base URL:** `http://localhost:3000` when n8n runs on the host, or
+     `http://themq:3000` when n8n shares TheMQ's Docker network.
+   - **API Token:** the `API_TOKEN` value from your Compose file.
+
+### Use it
+
+1. Add a **TheMQ Trigger** and select the credential.
+2. Enter the queue to listen to.
+3. Choose an **Acknowledge** mode. **Execution Finishes Successfully** retries
+   failed executions; **Immediately** acknowledges on arrival and cannot return
+   a failed message.
+4. Add your processing nodes.
+5. For manual control, choose **Specified Later in Workflow** and add a
+   **TheMQ → Acknowledge** node when the work is done.
+
+```text
+TheMQ Trigger → Your workflow → TheMQ (Acknowledge)
+```
+
+For all trigger modes, actions, and troubleshooting, see the
+[n8n node reference](n8n-nodes-themq/README.md).
+
+## API and integrations
+
+Everything the n8n nodes do is available over the JSON API, so any app can
+publish, consume, retry, and manage queues. All routes except health checks
+require an `Authorization: Bearer <token>` header.
+
+### REST API
 
 ```bash
-curl -sS -X POST localhost:3000/queues/orders/messages \
-  -H "Authorization: Bearer $API_TOKEN" \
+curl -X POST http://localhost:3000/queues/orders/messages \
+  -H "Authorization: Bearer YOUR_API_TOKEN" \
   -H "content-type: application/json" \
   -d '{"id":"order-42","data":{"message":"hello"}}'
 ```
 
-Publishing to a new queue declares it automatically. A new message returns
-`201 Created` with `state: "ready"`.
+A new message returns `201 Created` with `state: "ready"`. Publishing to a
+missing queue declares it automatically.
 
-### 3. Inspect the queue
+| Action      | Endpoint                                     |
+| ----------- | -------------------------------------------- |
+| Publish     | `POST /queues/{queue}/messages`              |
+| Consume     | `POST /queues/{queue}/consume`               |
+| Acknowledge | `POST /queues/{queue}/messages/{id}/ack`     |
+| Requeue     | `POST /queues/{queue}/messages/{id}/requeue` |
+| Delete      | `DELETE /queues/{queue}/messages/{id}`       |
+| Delay / TTL | `PUT /queues/{queue}/messages/{id}/ttl`      |
+| Queue stats | `GET /queues/{queue}`                        |
 
-```bash
-curl -sS -H "Authorization: Bearer $API_TOKEN" \
-  localhost:3000/queues/orders
+The full request and response reference lives in the
+[API documentation](docs/API.md).
+
+### WebSocket
+
+Connect to `ws://localhost:3000/queues/orders/subscribe` with the same bearer
+token, then exchange JSON frames:
+
+```text
+→ { "action": "hello", "consumerId": "worker-1", "prefetch": 10 }
+← { "type": "ready", "queue": "orders", "consumerId": "worker-1", "prefetch": 10 }
+← { "type": "message", "queue": "orders", "id": "order-42", "data": { "message": "hello" } }
+→ { "action": "ack", "id": "order-42" }
+← { "type": "acked", "id": "order-42", "deliveries": 1 }
 ```
 
-The response includes ready, delayed, and unacked depths plus lifetime
-counters. Consume, subscribe, and settle workflows are in the
-[API reference](docs/API.md).
+Persistent consumers hold messages with no deadline. Dropping the connection
+requeues pending messages; send a `requeue` frame to retry with new data or a
+delay. Message frames also include `consumerId`, `deliveryCount`,
+`redelivered`, and `visibleAt`. Use a client that can set the `Authorization`
+header during the upgrade.
 
-## Configuration
+### Other apps
 
-No `.env` file is required. For overrides, copy `.env.example` to `.env` and
-edit only what you need; see the [configuration reference](docs/configuration.md).
-
-## Use it with n8n
-
-1. In n8n, open **Settings → Community Nodes → Install**, enter
-   `n8n-nodes-themq`, and confirm.
-2. Add a **TheMQ API** credential:
-   - **Base URL:** `http://localhost:3000` (use `http://themq:3000` when n8n
-     runs in the same Docker network as TheMQ).
-   - **API Token:** the same `API_TOKEN` you set above.
-3. Add a **TheMQ Trigger**, choose the queue, and pick an acknowledge mode.
-4. Use **TheMQ → Publish / Acknowledge / Requeue / Delete Message** for actions.
-
-See the [n8n node reference](n8n-nodes-themq/README.md) for trigger modes,
-operation details, and troubleshooting.
-
-## Docs
-
-| Document                                        | What it covers                                 |
-| ----------------------------------------------- | ---------------------------------------------- |
-| [Documentation index](docs/README.md)           | Map of all docs                                |
-| [HTTP + WebSocket API](docs/API.md)             | Full API reference                             |
-| [Configuration](docs/configuration.md)          | Every environment variable                     |
-| [Deployment](docs/deployment.md)                | Production checklist, updating, backup, health |
-| [n8n node reference](n8n-nodes-themq/README.md) | Trigger modes, operations, examples            |
-| [.env.example](.env.example)                    | Optional environment overrides                 |
-
-## Commands
-
-| Task                       | Command                                              |
-| -------------------------- | ---------------------------------------------------- |
-| Start                      | `docker compose up -d --wait`                        |
-| Stop                       | `docker compose stop`                                |
-| Restart                    | `docker compose restart`                             |
-| Update image               | `docker compose pull && docker compose up -d --wait` |
-| Follow logs                | `docker compose logs -f themq`                       |
-| Check health               | `curl -fsS localhost:3000/health/ready`              |
-| Stop and remove containers | `docker compose down`                                |
-
-`docker compose down` leaves the Redis data in `./data/redis`.
-
-## Troubleshooting
-
-| Problem                       | What to try                                                                                                                           |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `401` / `UNAUTHENTICATED`     | Compare the request token with `API_TOKEN`. After changing it, recreate TheMQ (`docker compose up -d`) and update the n8n credential. |
-| `/health/ready` returns `503` | Redis is not ready. Check `docker compose logs redis` and make sure the service is running.                                           |
-| n8n cannot reach TheMQ        | When n8n runs in Docker, use `http://themq:3000` on the shared network, not `localhost`.                                              |
-| Port 3000 is already in use   | Start with `API_PORT=3001 docker compose up -d`, then use `localhost:3001` and update the n8n Base URL.                               |
+The API is plain JSON over HTTP and WebSocket, so no SDK is required. Use
+`curl`, `fetch`, `requests`, `axios`, Go, or any other HTTP client. Containers
+on the same Compose network can reach TheMQ at `http://themq:3000`; production
+deployments should use a private network or a TLS reverse proxy. See
+[Deployment](docs/deployment.md) for the production checklist.
 
 ## License
 
