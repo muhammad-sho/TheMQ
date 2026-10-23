@@ -4,6 +4,73 @@
  * KEYS/ARGV contract each caller must honor.
  */
 
+import { PENDING_SUFFIX } from "./keys.js";
+
+/** Initialize the per-queue counters hash (createdAt supplied by caller). */
+const META_HELPERS = `
+local function init_meta(meta, createdAt)
+  redis.call('HSET', meta, 'createdAt', createdAt, 'published', 0, 'delivered', 0, 'acked', 0, 'requeued', 0, 'deleted', 0, 'updated', 0)
+end
+`;
+
+/** Move one message between the ready list and delayed zset. */
+const WAITING_HELPERS = `
+local function remove_waiting(ready, delayed, state, id)
+  if state == 'ready' then
+    redis.call('LREM', ready, 0, id)
+  elseif state == 'delayed' then
+    redis.call('ZREM', delayed, id)
+  end
+end
+local function place_waiting(ready, delayed, id, availableAt, now)
+  if tonumber(availableAt) <= tonumber(now) then
+    redis.call('RPUSH', ready, id)
+    return 'ready'
+  end
+  redis.call('ZADD', delayed, availableAt, id)
+  return 'delayed'
+end
+`;
+
+/** Promote due messages and reclaim expired leases (consume + sweep). */
+const QUEUE_SCAN_HELPERS = `
+local function promote_due(ready, delayed, msgPrefix, now, scan)
+  local promoted = 0
+  local due = redis.call('ZRANGEBYSCORE', delayed, 0, now, 'LIMIT', 0, scan)
+  for _, id in ipairs(due) do
+    redis.call('ZREM', delayed, id)
+    local m = msgPrefix .. id
+    if redis.call('EXISTS', m) == 1 then
+      redis.call('HSET', m, 'state', 'ready', 'availableAt', now, 'updatedAt', now)
+      redis.call('RPUSH', ready, id)
+      promoted = promoted + 1
+    end
+  end
+  return promoted
+end
+local function reclaim_expired(meta, ready, unacked, msgPrefix, pendPrefix, now, scan)
+  local reclaimed = 0
+  local expired = redis.call('ZRANGEBYSCORE', unacked, 0, now, 'LIMIT', 0, scan)
+  for _, id in ipairs(expired) do
+    redis.call('ZREM', unacked, id)
+    local m = msgPrefix .. id
+    local owner = redis.call('HGET', m, 'consumer')
+    if owner and owner ~= '' then
+      redis.call('SREM', pendPrefix .. owner .. '${PENDING_SUFFIX}', id)
+    end
+    if redis.call('EXISTS', m) == 1 then
+      redis.call('HSET', m, 'state', 'ready', 'consumer', '', 'visibleAt', 0, 'updatedAt', now)
+      redis.call('RPUSH', ready, id)
+      reclaimed = reclaimed + 1
+    end
+  end
+  if reclaimed > 0 then
+    redis.call('HINCRBY', meta, 'requeued', reclaimed)
+  end
+  return reclaimed
+end
+`;
+
 /**
  * Delete a queue and every message in it. Concurrent publishes land
  * fully before the script (removed) or fully after it (consistent queue).
@@ -30,7 +97,7 @@ if cursor ~= '0' then
   return {'PARTIAL'}
 end
 for _, id in ipairs(redis.call('HKEYS', KEYS[6])) do
-  redis.call('UNLINK', ARGV[3] .. id .. ':pending')
+  redis.call('UNLINK', ARGV[3] .. id .. '${PENDING_SUFFIX}')
 end
 redis.call('UNLINK', KEYS[2], KEYS[3], KEYS[4], KEYS[5], KEYS[6])
 redis.call('SREM', KEYS[1], ARGV[1])
@@ -38,12 +105,12 @@ return {'OK'}
 `;
 
 /** SADD queue + initialise counters. Returns 1 when newly created. */
-export const DECLARE_SCRIPT = `
+export const DECLARE_SCRIPT = `${META_HELPERS}
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then
   return 0
 end
 redis.call('SADD', KEYS[1], ARGV[1])
-redis.call('HSET', KEYS[2], 'createdAt', ARGV[2], 'published', 0, 'delivered', 0, 'acked', 0, 'requeued', 0, 'deleted', 0, 'updated', 0)
+init_meta(KEYS[2], ARGV[2])
 return 1
 `;
 
@@ -59,12 +126,12 @@ return 1
  * Returns {'OK', state, upserted, createdAt} | {'CONFLICT'} | {'LEASED'} |
  * {'SKIPPED', state, availableAt, createdAt, deliveries}.
  */
-export const PUBLISH_SCRIPT = `
+export const PUBLISH_SCRIPT = `${META_HELPERS}${WAITING_HELPERS}
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
   redis.call('SADD', KEYS[1], ARGV[1])
 end
 if redis.call('EXISTS', KEYS[2]) == 0 then
-  redis.call('HSET', KEYS[2], 'createdAt', ARGV[5], 'published', 0, 'delivered', 0, 'acked', 0, 'requeued', 0, 'deleted', 0, 'updated', 0)
+  init_meta(KEYS[2], ARGV[5])
 end
 local function skipped()
   local info = redis.call('HMGET', KEYS[5], 'state', 'availableAt', 'createdAt', 'deliveries')
@@ -87,20 +154,9 @@ if exists == 1 then
     return {'LEASED'}
   end
   upserted = 1
-  if current == 'ready' then
-    redis.call('LREM', KEYS[3], 0, ARGV[2])
-  elseif current == 'delayed' then
-    redis.call('ZREM', KEYS[4], ARGV[2])
-  end
+  remove_waiting(KEYS[3], KEYS[4], current, ARGV[2])
 end
-local state
-if tonumber(ARGV[4]) <= tonumber(ARGV[5]) then
-  state = 'ready'
-  redis.call('RPUSH', KEYS[3], ARGV[2])
-else
-  state = 'delayed'
-  redis.call('ZADD', KEYS[4], ARGV[4], ARGV[2])
-end
+local state = place_waiting(KEYS[3], KEYS[4], ARGV[2], ARGV[4], ARGV[5])
 redis.call('HSET', KEYS[5],
   'id', ARGV[2], 'queue', ARGV[1], 'data', ARGV[3], 'state', state,
   'consumer', '', 'deliveries', 0, 'availableAt', ARGV[4], 'visibleAt', 0,
@@ -130,7 +186,7 @@ return {'OK', state, upserted, createdAt}
  *       defaultPrefetch
  * Returns {'NOT_FOUND'} | {'OK', delivered, outstanding, id, data, deliveries, ...}.
  */
-export const CONSUME_SCRIPT = `
+export const CONSUME_SCRIPT = `${QUEUE_SCAN_HELPERS}
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
   return {'NOT_FOUND'}
 end
@@ -156,29 +212,8 @@ else
     effPrefetch = tonumber(ARGV[10])
   end
 end
-local due = redis.call('ZRANGEBYSCORE', KEYS[4], 0, now, 'LIMIT', 0, scan)
-for _, id in ipairs(due) do
-  redis.call('ZREM', KEYS[4], id)
-  local m = ARGV[8] .. id
-  if redis.call('EXISTS', m) == 1 then
-    redis.call('HSET', m, 'state', 'ready', 'availableAt', now, 'updatedAt', now)
-    redis.call('RPUSH', KEYS[3], id)
-  end
-end
-local expired = redis.call('ZRANGEBYSCORE', KEYS[5], 0, now, 'LIMIT', 0, scan)
-for _, id in ipairs(expired) do
-  redis.call('ZREM', KEYS[5], id)
-  local m = ARGV[8] .. id
-  local owner = redis.call('HGET', m, 'consumer')
-  if owner and owner ~= '' then
-    redis.call('SREM', ARGV[9] .. owner .. ':pending', id)
-  end
-  if redis.call('EXISTS', m) == 1 then
-    redis.call('HSET', m, 'state', 'ready', 'consumer', '', 'visibleAt', 0, 'updatedAt', now)
-    redis.call('RPUSH', KEYS[3], id)
-    redis.call('HINCRBY', KEYS[2], 'requeued', 1)
-  end
-end
+promote_due(KEYS[3], KEYS[4], ARGV[8], now, scan)
+reclaim_expired(KEYS[2], KEYS[3], KEYS[5], ARGV[8], ARGV[9], now, scan)
 local outstanding = redis.call('SCARD', KEYS[7])
 local allowed = math.min(tonumber(ARGV[3]), effPrefetch - outstanding)
 if allowed <= 0 then
@@ -229,7 +264,7 @@ local owner = redis.call('HGET', KEYS[3], 'consumer')
 local deliveries = redis.call('HGET', KEYS[3], 'deliveries')
 redis.call('ZREM', KEYS[2], ARGV[1])
 if owner and owner ~= '' then
-  redis.call('SREM', ARGV[2] .. owner .. ':pending', ARGV[1])
+  redis.call('SREM', ARGV[2] .. owner .. '${PENDING_SUFFIX}', ARGV[1])
 end
 redis.call('DEL', KEYS[3])
 redis.call('HINCRBY', KEYS[1], 'acked', 1)
@@ -245,7 +280,7 @@ return {'OK', deliveries or '0'}
  * Returns {'OK', deliveries, next, availableAt} | {'NOT_FOUND'} |
  *         {'CONFLICT', state}.
  */
-export const REQUEUE_SCRIPT = `
+export const REQUEUE_SCRIPT = `${WAITING_HELPERS}
 if redis.call('EXISTS', KEYS[5]) == 0 then
   return {'NOT_FOUND'}
 end
@@ -257,19 +292,12 @@ local owner = redis.call('HGET', KEYS[5], 'consumer')
 local deliveries = redis.call('HGET', KEYS[5], 'deliveries')
 redis.call('ZREM', KEYS[4], ARGV[1])
 if owner and owner ~= '' then
-  redis.call('SREM', ARGV[3] .. owner .. ':pending', ARGV[1])
+  redis.call('SREM', ARGV[3] .. owner .. '${PENDING_SUFFIX}', ARGV[1])
 end
 if ARGV[4] ~= '' then
   redis.call('HSET', KEYS[5], 'data', ARGV[4])
 end
-local next
-if tonumber(ARGV[5]) <= tonumber(ARGV[2]) then
-  next = 'ready'
-  redis.call('RPUSH', KEYS[2], ARGV[1])
-else
-  next = 'delayed'
-  redis.call('ZADD', KEYS[3], ARGV[5], ARGV[1])
-end
+local next = place_waiting(KEYS[2], KEYS[3], ARGV[1], ARGV[5], ARGV[2])
 redis.call('HSET', KEYS[5], 'state', next, 'consumer', '', 'visibleAt', 0,
   'availableAt', ARGV[5], 'updatedAt', ARGV[2])
 redis.call('HINCRBY', KEYS[1], 'requeued', 1)
@@ -282,7 +310,7 @@ return {'OK', deliveries or '0', next, ARGV[5]}
  * ARGV: id
  * Returns {'OK', state} | {'NOT_FOUND'} | {'CONFLICT', state}.
  */
-export const DELETE_MESSAGE_SCRIPT = `
+export const DELETE_MESSAGE_SCRIPT = `${WAITING_HELPERS}
 if redis.call('EXISTS', KEYS[4]) == 0 then
   return {'NOT_FOUND'}
 end
@@ -290,11 +318,7 @@ local state = redis.call('HGET', KEYS[4], 'state')
 if state == 'unacked' then
   return {'CONFLICT', state}
 end
-if state == 'ready' then
-  redis.call('LREM', KEYS[2], 0, ARGV[1])
-elseif state == 'delayed' then
-  redis.call('ZREM', KEYS[3], ARGV[1])
-end
+remove_waiting(KEYS[2], KEYS[3], state, ARGV[1])
 redis.call('DEL', KEYS[4])
 redis.call('HINCRBY', KEYS[1], 'deleted', 1)
 return {'OK', state or ''}
@@ -307,7 +331,7 @@ return {'OK', state or ''}
  * ARGV: id, availableAt, now
  * Returns {'OK', state} | {'NOT_FOUND'} | {'CONFLICT', state}.
  */
-export const SET_TTL_SCRIPT = `
+export const SET_TTL_SCRIPT = `${WAITING_HELPERS}
 if redis.call('EXISTS', KEYS[4]) == 0 then
   return {'NOT_FOUND'}
 end
@@ -315,19 +339,8 @@ local state = redis.call('HGET', KEYS[4], 'state')
 if state == 'unacked' then
   return {'CONFLICT', state}
 end
-if state == 'ready' then
-  redis.call('LREM', KEYS[2], 0, ARGV[1])
-elseif state == 'delayed' then
-  redis.call('ZREM', KEYS[3], ARGV[1])
-end
-local next
-if tonumber(ARGV[2]) <= tonumber(ARGV[3]) then
-  next = 'ready'
-  redis.call('RPUSH', KEYS[2], ARGV[1])
-else
-  next = 'delayed'
-  redis.call('ZADD', KEYS[3], ARGV[2], ARGV[1])
-end
+remove_waiting(KEYS[2], KEYS[3], state, ARGV[1])
+local next = place_waiting(KEYS[2], KEYS[3], ARGV[1], ARGV[2], ARGV[3])
 redis.call('HSET', KEYS[4], 'state', next, 'availableAt', ARGV[2], 'updatedAt', ARGV[3])
 return {'OK', next}
 `;
@@ -389,7 +402,7 @@ for i = 1, #res[2], 2 do
     redis.call('RPUSH', KEYS[3], id)
     requeued = requeued + 1
     if owner and owner ~= '' then
-      local pend = ARGV[4] .. owner .. ':pending'
+      local pend = ARGV[4] .. owner .. '${PENDING_SUFFIX}'
       redis.call('SREM', pend, id)
       redis.call('DEL', pend)
     end
@@ -411,38 +424,11 @@ return {'OK', requeued, next}
  * ARGV: now, maxScan, pendPrefix, msgPrefix
  * Returns {'OK', promoted, reclaimed}.
  */
-export const SWEEP_SCRIPT = `
+export const SWEEP_SCRIPT = `${QUEUE_SCAN_HELPERS}
 local now = tonumber(ARGV[1])
 local scan = tonumber(ARGV[2])
-local promoted = 0
-local due = redis.call('ZRANGEBYSCORE', KEYS[3], 0, now, 'LIMIT', 0, scan)
-for _, id in ipairs(due) do
-  redis.call('ZREM', KEYS[3], id)
-  local m = ARGV[4] .. id
-  if redis.call('EXISTS', m) == 1 then
-    redis.call('HSET', m, 'state', 'ready', 'availableAt', now, 'updatedAt', now)
-    redis.call('RPUSH', KEYS[2], id)
-    promoted = promoted + 1
-  end
-end
-local reclaimed = 0
-local expired = redis.call('ZRANGEBYSCORE', KEYS[4], 0, now, 'LIMIT', 0, scan)
-for _, id in ipairs(expired) do
-  redis.call('ZREM', KEYS[4], id)
-  local m = ARGV[4] .. id
-  local owner = redis.call('HGET', m, 'consumer')
-  if owner and owner ~= '' then
-    redis.call('SREM', ARGV[3] .. owner .. ':pending', id)
-  end
-  if redis.call('EXISTS', m) == 1 then
-    redis.call('HSET', m, 'state', 'ready', 'consumer', '', 'visibleAt', 0, 'updatedAt', now)
-    redis.call('RPUSH', KEYS[2], id)
-    reclaimed = reclaimed + 1
-  end
-end
-if reclaimed > 0 then
-  redis.call('HINCRBY', KEYS[1], 'requeued', reclaimed)
-end
+local promoted = promote_due(KEYS[2], KEYS[3], ARGV[4], now, scan)
+local reclaimed = reclaim_expired(KEYS[1], KEYS[2], KEYS[4], ARGV[4], ARGV[3], now, scan)
 return {'OK', promoted, reclaimed}
 `;
 

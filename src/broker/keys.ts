@@ -6,6 +6,9 @@
  * that use SCAN patterns must escape glob characters via `escapeGlob`.
  */
 
+/** Suffix shared by the pending-set key builder and the Lua scripts. */
+export const PENDING_SUFFIX = ":pending";
+
 export interface QueueKeys {
   /** Set of all declared queue names. */
   registry: string;
@@ -44,7 +47,7 @@ export function messageKey(keys: QueueKeys, id: string): string {
 }
 
 export function pendingKey(keys: QueueKeys, consumerId: string): string {
-  return `${keys.pendingPrefix}${consumerId}:pending`;
+  return `${keys.pendingPrefix}${consumerId}${PENDING_SUFFIX}`;
 }
 
 /** Escape Redis glob characters so a queue name is safe in SCAN MATCH. */
