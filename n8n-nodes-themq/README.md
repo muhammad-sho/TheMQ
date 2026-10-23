@@ -1,7 +1,7 @@
 # n8n-nodes-themq
 
 [![npm version](https://img.shields.io/npm/v/n8n-nodes-themq.svg)](https://www.npmjs.com/package/n8n-nodes-themq)
-[![license](https://img.shields.io/badge/license-ISC-blue.svg)](../LICENSE)
+[![license](https://img.shields.io/badge/license-ISC-blue.svg)](LICENSE)
 
 Native n8n community nodes for [TheMQ](https://github.com/muhammad-sho/TheMQ) — a lightweight,
 Redis-backed message broker built around queues and consumers.
@@ -192,4 +192,4 @@ npm run build        # tsc -> dist/ (+ icons)
 
 ## License
 
-ISC — see [LICENSE](../LICENSE).
+ISC — see [LICENSE](LICENSE).
