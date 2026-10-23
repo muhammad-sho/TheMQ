@@ -4,8 +4,10 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { TheMq } = require("../dist/nodes/TheMq/TheMq.node.js");
 
-function nodeContext(options) {
+function nodeContext(options, behavior = {}) {
   const calls = [];
+  let requeueAttempts = 0;
+  let ttlAttempts = 0;
   const context = {
     calls,
     getInputData: () => [{ json: { data: { v: 1 } } }],
@@ -31,9 +33,20 @@ function nodeContext(options) {
         call: async (_thisArg, _credential, request) => {
           calls.push(request);
           if (request.method === "POST" && request.url.endsWith("/requeue")) {
-            throw new Error(
-              "TheMQ CONFLICT: Cannot requeue message 'msg_test' while it is delayed.",
-            );
+            requeueAttempts += 1;
+            if (!behavior.requeueSucceedsOnRetry || requeueAttempts === 1) {
+              throw new Error(
+                "TheMQ CONFLICT: Cannot requeue message 'msg_test' while it is delayed.",
+              );
+            }
+            return {
+              id: "msg_test",
+              queue: "q",
+              requeued: true,
+              state: "ready",
+              availableAt: 456,
+              deliveries: 0,
+            };
           }
           if (request.method === "GET") {
             return {
@@ -46,6 +59,12 @@ function nodeContext(options) {
             };
           }
           if (request.method === "PUT" && request.url.endsWith("/ttl")) {
+            ttlAttempts += 1;
+            if (behavior.ttlConflict && ttlAttempts === 1) {
+              throw new Error(
+                "TheMQ CONFLICT: Cannot change message 'msg_test' while it is unacked.",
+              );
+            }
             return {
               id: "msg_test",
               queue: "q",
@@ -76,6 +95,8 @@ test("requeue with ttlMs 0 promotes a delayed message via the TTL endpoint", asy
           id: "msg_test",
           state: "ready",
           availableAt: 456,
+          deliveryCount: 0,
+          data: { v: 1 },
         },
       },
     ],
@@ -87,6 +108,36 @@ test("requeue with ttlMs 0 promotes a delayed message via the TTL endpoint", asy
       ["POST", "/queues/q/messages/msg_test/requeue", { ttlMs: 0 }],
       ["GET", "/queues/q/messages/msg_test", undefined],
       ["PUT", "/queues/q/messages/msg_test/ttl", { ttl: 0 }],
+    ],
+  );
+});
+
+test("requeue with ttlMs 0 retries when a consumer leases during the TTL update", async () => {
+  const context = nodeContext({ ttlMs: 0 }, { ttlConflict: true, requeueSucceedsOnRetry: true });
+  const result = await new TheMq().execute.call(context);
+
+  assert.deepEqual(result, [
+    [
+      {
+        json: {
+          id: "msg_test",
+          queue: "q",
+          requeued: true,
+          state: "ready",
+          availableAt: 456,
+          deliveries: 0,
+        },
+      },
+    ],
+  ]);
+
+  assert.deepEqual(
+    context.calls.map((call) => [call.method, call.url, call.body]),
+    [
+      ["POST", "/queues/q/messages/msg_test/requeue", { ttlMs: 0 }],
+      ["GET", "/queues/q/messages/msg_test", undefined],
+      ["PUT", "/queues/q/messages/msg_test/ttl", { ttl: 0 }],
+      ["POST", "/queues/q/messages/msg_test/requeue", { ttlMs: 0 }],
     ],
   );
 });

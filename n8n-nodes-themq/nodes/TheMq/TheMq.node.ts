@@ -463,15 +463,35 @@ async function ensureQueued(
     }
   }
   // Delay-only: the TTL endpoint moves the message without touching
-  // the payload or the delivery count.
-  const moved = await request.call(
-    context,
-    "PUT",
-    messageActionPath(queue, messageId, "ttl"),
-    { ttl: delayMs },
-    { ...requestContext },
-  );
-  return { queue, messageId, requeued: false, alreadyQueued: true, ...toDataObject(moved) };
+  // the payload or the delivery count. If a consumer leases it between
+  // the GET and the TTL call, retry the requeue once on the new terms.
+  try {
+    const moved = await request.call(
+      context,
+      "PUT",
+      messageActionPath(queue, messageId, "ttl"),
+      { ttl: delayMs },
+      { ...requestContext },
+    );
+    return {
+      queue,
+      messageId,
+      requeued: false,
+      alreadyQueued: true,
+      // Keep the waiting message's payload/count in the result, as the
+      // no-op path does, while the TTL response supplies the new state.
+      data: current["data"],
+      deliveryCount: current["deliveryCount"],
+      ...toDataObject(moved),
+    };
+  } catch (ttlError) {
+    if (apiCodeOf(ttlError) === "CONFLICT") {
+      return toDataObject(
+        await requeueMessage(context, queue, messageId, requeueBody, requestContext),
+      );
+    }
+    throw ttlError;
+  }
 }
 
 async function request(
