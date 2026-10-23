@@ -1,6 +1,7 @@
 import type { AppInstance } from "../api/server.js";
 import { buildApp, type ApiServices } from "../api/server.js";
-import { BrokerService } from "../broker/broker.js";
+import type { BrokerService } from "../broker/broker.js";
+import { createBroker } from "../broker/factory.js";
 import { QueueSweeper } from "../broker/sweeper.js";
 import { SubscriptionManager } from "../broker/subscriptions.js";
 import { resolveApiAuth } from "../config/api-token.js";
@@ -56,13 +57,7 @@ export async function buildSystem(input: AppConfig): Promise<BuiltSystem> {
     throw err;
   }
 
-  const broker = new BrokerService(shared, {
-    prefix: config.redisKeyPrefix,
-    defaultVisibilityTimeoutMs: config.defaultVisibilityTimeoutMs,
-    defaultPrefetch: config.defaultPrefetch,
-    maxConsumeCount: config.maxConsumeCount,
-    maxMessageBytes: config.maxMessageBytes,
-  });
+  const broker = createBroker(shared, config);
   const sweeper = new QueueSweeper(broker, config.sweeperIntervalMs, logger);
   const subscriptions = new SubscriptionManager(broker, logger);
   subscriptions.attach();

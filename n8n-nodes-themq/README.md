@@ -11,7 +11,7 @@ Redis-backed message broker built around queues and consumers.
 In n8n: **Settings → Community Nodes → Install** → `n8n-nodes-themq`.
 Or `npm install n8n-nodes-themq` in `~/.n8n`, then restart n8n.
 
-Add a **TheMQ API** credential: the TheMQ **Base URL**
+Add a **TheMQ API** credential: the **Base URL**
 (e.g. `http://themq:3000`) and the **API Token** — the `API_TOKEN` value
 pinned in `docker-compose.yml` (overridable via environment).
 
@@ -101,7 +101,7 @@ in order:
    `docker compose pull && docker compose up -d`, then
    `curl http://<host>:3000/health/ready`.
 2. Redis is healthy (`/health/ready` returns 200, not 503).
-3. The TheMQ logs around activation (`docker compose logs themq`):
+3. TheMQ logs around activation (`docker compose logs themq`):
    `Consumer connected` means the hello succeeded; `subscribe-failed` /
    `frame-failed` entries explain the refusal.
 

@@ -1,14 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { buildSystem, type BuiltSystem } from "../../src/app/build-app.js";
-import { testConfig, uniquePrefix } from "./helpers.js";
-
-function portOf(system: BuiltSystem): number {
-  const address = system.fastifyApp.server.address();
-  if (typeof address === "object" && address !== null && "port" in address) {
-    return address.port;
-  }
-  throw new Error("Server is not listening");
-}
+import { portOf, testConfig, uniquePrefix } from "./helpers.js";
 
 describe("broker HTTP API", () => {
   let system: BuiltSystem;

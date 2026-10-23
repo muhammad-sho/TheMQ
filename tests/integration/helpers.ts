@@ -1,5 +1,7 @@
+import type { AppInstance } from "../../src/api/server.js";
 import { loadConfig, type AppConfig } from "../../src/config/env.js";
-import { BrokerService } from "../../src/broker/broker.js";
+import type { BrokerService } from "../../src/broker/broker.js";
+import { createBroker } from "../../src/broker/factory.js";
 import { QueueSweeper } from "../../src/broker/sweeper.js";
 import { createLogger } from "../../src/infrastructure/logging/logger.js";
 import { RedisConnectionManager } from "../../src/infrastructure/redis/connection-manager.js";
@@ -9,6 +11,15 @@ export const REDIS_URL = process.env["REDIS_URL"] ?? "redis://127.0.0.1:6379";
 export function uniquePrefix(tag: string): string {
   const rand = Math.floor(Math.random() * 1_000_000).toString(36);
   return `it-${tag}-${process.pid.toString(36)}-${rand}`;
+}
+
+/** Port of a listening Fastify app (tests bind port 0). */
+export function portOf(system: { fastifyApp: AppInstance }): number {
+  const address = system.fastifyApp.server.address();
+  if (typeof address === "object" && address !== null && "port" in address) {
+    return address.port;
+  }
+  throw new Error("Server is not listening");
 }
 
 export function testConfig(prefix: string, env: Record<string, string> = {}): AppConfig {
@@ -52,13 +63,7 @@ export async function buildTestBroker(
   const connections = new RedisConnectionManager(REDIS_URL, logger);
   const shared = connections.getShared();
   await connections.waitUntilReady();
-  const broker = new BrokerService(shared, {
-    prefix: config.redisKeyPrefix,
-    defaultVisibilityTimeoutMs: config.defaultVisibilityTimeoutMs,
-    defaultPrefetch: config.defaultPrefetch,
-    maxConsumeCount: config.maxConsumeCount,
-    maxMessageBytes: config.maxMessageBytes,
-  });
+  const broker = createBroker(shared, config);
   const sweeper = new QueueSweeper(broker, config.sweeperIntervalMs, logger);
   sweeper.start();
   return { config, connections, broker, sweeper };

@@ -265,8 +265,6 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
         );
         return undefined;
       }
-      // visibilityTimeoutMs validates but is ignored: persistent
-      // deliveries carry no deadline.
       return {
         ...(result.data.consumerId !== undefined ? { consumerId: result.data.consumerId } : {}),
         ...(result.data.prefetch !== undefined ? { prefetch: result.data.prefetch } : {}),

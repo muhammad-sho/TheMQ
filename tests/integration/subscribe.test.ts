@@ -3,19 +3,15 @@ import { WebSocket } from "ws";
 import type { BuiltSystem } from "../../src/app/build-app.js";
 import { buildSystem } from "../../src/app/build-app.js";
 import { frameToString } from "../../src/api/frames.js";
-import { testConfig, uniquePrefix } from "./helpers.js";
+import {
+  SUBSCRIBE_CLOSE_QUEUE_DELETED,
+  SUBSCRIBE_CLOSE_UNKNOWN_QUEUE,
+} from "../../src/api/routes/subscribe.js";
+import { portOf, testConfig, uniquePrefix } from "./helpers.js";
 
 interface ServerFrame {
   type: string;
   [key: string]: unknown;
-}
-
-function portOf(system: BuiltSystem): number {
-  const address = system.fastifyApp.server.address();
-  if (typeof address === "object" && address !== null && "port" in address) {
-    return address.port;
-  }
-  throw new Error("Server is not listening");
 }
 
 /** Open a raw consumer socket with frame helpers. */
@@ -182,7 +178,7 @@ describe("persistent consumers (WebSocket subscribe)", () => {
     await waitOpen(ws);
     ws.send(JSON.stringify({ action: "hello" }));
     await expect(nextFrame()).resolves.toMatchObject({ type: "error", code: "NOT_FOUND" });
-    await expect(closed).resolves.toMatchObject({ code: 4404 });
+    await expect(closed).resolves.toMatchObject({ code: SUBSCRIBE_CLOSE_UNKNOWN_QUEUE });
   });
 
   it("answers hello with an error and closes when subscribing fails mid-handshake", async () => {
@@ -372,7 +368,7 @@ describe("persistent consumers (WebSocket subscribe)", () => {
 
     const res = await fetch(`${base}/queues/doomed`, { method: "DELETE" });
     expect(res.status).toBe(204);
-    await expect(closed).resolves.toMatchObject({ code: 4410 });
+    await expect(closed).resolves.toMatchObject({ code: SUBSCRIBE_CLOSE_QUEUE_DELETED });
   });
 
   it("keeps the live subscriber when a stale socket with the same consumer id closes", async () => {

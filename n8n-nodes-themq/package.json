@@ -9,7 +9,7 @@
     "message-queue",
     "broker"
   ],
-  "license": "MIT",
+  "license": "ISC",
   "homepage": "https://github.com/muhammad-sho/TheMQ/tree/main/n8n-nodes-themq",
   "author": {
     "name": "TheMQ contributors"

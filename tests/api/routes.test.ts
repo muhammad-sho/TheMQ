@@ -3,6 +3,7 @@ import type { AppInstance, ApiServices } from "../../src/api/server.js";
 import { buildApp } from "../../src/api/server.js";
 import type { BrokerService } from "../../src/broker/broker.js";
 import { SubscriptionManager } from "../../src/broker/subscriptions.js";
+import type { QueueStats } from "../../src/broker/types.js";
 import { loadConfig } from "../../src/config/env.js";
 import { HealthService } from "../../src/health/health-service.js";
 import { createLogger } from "../../src/infrastructure/logging/logger.js";
@@ -20,6 +21,23 @@ async function buildTestApp(broker: BrokerService): Promise<AppInstance> {
   return app;
 }
 
+function queueStats(queue: string): QueueStats {
+  return {
+    queue,
+    ready: 1,
+    delayed: 0,
+    unacked: 0,
+    consumers: [],
+    published: 1,
+    delivered: 0,
+    acked: 0,
+    requeued: 0,
+    deleted: 0,
+    updated: 0,
+    createdAt: 1,
+  };
+}
+
 function mockBroker(): BrokerService {
   return {
     declareQueue: vi
@@ -28,21 +46,7 @@ function mockBroker(): BrokerService {
     listQueues: vi
       .fn()
       .mockResolvedValue([{ queue: "orders", ready: 2, delayed: 0, unacked: 0, consumers: 0 }]),
-    getQueue: vi.fn().mockImplementation((queue: string) =>
-      Promise.resolve({
-        queue,
-        ready: 1,
-        delayed: 0,
-        unacked: 0,
-        consumers: [],
-        published: 1,
-        delivered: 0,
-        acked: 0,
-        requeued: 0,
-        deleted: 0,
-        createdAt: 1,
-      }),
-    ),
+    getQueue: vi.fn().mockImplementation((queue: string) => Promise.resolve(queueStats(queue))),
     deleteQueue: vi.fn().mockResolvedValue(undefined),
     publish: vi.fn().mockImplementation((queue: string) =>
       Promise.resolve({
