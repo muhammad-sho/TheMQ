@@ -135,7 +135,8 @@ Publish · Acknowledge · Requeue · Delete Message
   Options, or a trigger item carrying the payload). Queue and Message
   ID default to the trigger item; the optional Options (+) take a
   replacement Message Data and a Delay before it becomes available
-  again. Empty options requeue with the original details.
+  again (a Delay of `0` releases a waiting delayed message immediately).
+  Empty options requeue with the original details.
 - **Delete Message** — removes a waiting message so it is never
   processed. Queue and Message ID default to the trigger item.
 

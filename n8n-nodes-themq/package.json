@@ -24,6 +24,7 @@
     "build": "tsc -p tsconfig.json && npm run copy:icons",
     "copy:icons": "mkdir -p dist/nodes/TheMq dist/nodes/TheMqTrigger && cp nodes/TheMq/themq.png dist/nodes/TheMq/themq.png && cp nodes/TheMqTrigger/themq.png dist/nodes/TheMqTrigger/themq.png",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "npm run build && node --test tests/*.test.cjs",
     "lint": "eslint credentials nodes index.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

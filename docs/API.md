@@ -195,7 +195,8 @@ Client actions:
 Violations and settle failures arrive as
 `{ "type": "error", "code", "message", "id"? }` and never close the socket.
 Settling a message that is not leased reports `CONFLICT`, exactly like
-the HTTP endpoints.
+the HTTP endpoints. Requeue frames are strict: only `action`, `id`,
+`data`, and `ttlMs` are accepted; unknown fields report `PROTOCOL_ERROR`.
 
 Lifecycle:
 

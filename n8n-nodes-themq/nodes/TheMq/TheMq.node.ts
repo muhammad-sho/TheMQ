@@ -131,7 +131,7 @@ export class TheMq implements INodeType {
           },
         ],
         description:
-          "What to do when the message ID already exists (queued or leased). Upsert above takes precedence when enabled.",
+          "Upsert updates waiting messages in place. Leased messages always conflict; choose Skip to leave one untouched.",
       },
       {
         displayName: "Delay (Ms)",
@@ -230,8 +230,11 @@ export class TheMq implements INodeType {
           const replacement = hasReplacement
             ? parseMessageData(this, options.messageData, i)
             : undefined;
+          // Zero is an explicit "available now" release, not "no delay
+          // given": the requeue fallback uses this to promote a delayed
+          // message via the TTL endpoint.
           const delayMs =
-            typeof options.ttlMs === "number" && options.ttlMs > 0
+            typeof options.ttlMs === "number" && options.ttlMs >= 0
               ? Math.floor(options.ttlMs)
               : undefined;
           const requeueBody = buildRequeueBody(replacement, hasReplacement, delayMs);

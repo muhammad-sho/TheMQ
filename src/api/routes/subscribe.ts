@@ -1,7 +1,7 @@
 import type * as WebSocket from "ws";
 import { ApiError } from "../errors.js";
 import { frameToString } from "../frames.js";
-import { requeueBodySchema } from "../schemas/messages.js";
+import { requeueFrameSchema } from "../schemas/subscribe.js";
 import type { OutgoingMessage, SubscriberHandle } from "../../broker/subscriptions.js";
 import type { Json } from "../../broker/types.js";
 import { queueParamsSchema } from "../schemas/common.js";
@@ -280,10 +280,7 @@ export function registerSubscribeRoutes(app: AppInstance, services: ApiServices)
     function parseRequeueExtras(
       record: Record<string, unknown>,
     ): { data?: Json; ttlMs?: number } | undefined {
-      const candidate: Record<string, unknown> = {};
-      if (record["data"] !== undefined) candidate["data"] = record["data"];
-      if (record["ttlMs"] !== undefined) candidate["ttlMs"] = record["ttlMs"];
-      const result = requeueBodySchema.safeParse(candidate);
+      const result = requeueFrameSchema.safeParse(record);
       if (!result.success) {
         const id = record["id"];
         sendFrame(

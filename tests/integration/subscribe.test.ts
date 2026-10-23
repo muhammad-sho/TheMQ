@@ -286,6 +286,8 @@ describe("persistent consumers (WebSocket subscribe)", () => {
     await nextFrame();
     ws.send(JSON.stringify({ action: "requeue", id, ttlMs: -5 }));
     await expect(nextFrame()).resolves.toMatchObject({ type: "error", code: "PROTOCOL_ERROR", id });
+    ws.send(JSON.stringify({ action: "requeue", id, unknownOption: true }));
+    await expect(nextFrame()).resolves.toMatchObject({ type: "error", code: "PROTOCOL_ERROR", id });
     expect(ws.readyState).toBe(WebSocket.OPEN);
     ws.close();
   });
