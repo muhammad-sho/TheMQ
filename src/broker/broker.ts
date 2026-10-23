@@ -183,17 +183,62 @@ function unackedConflict(queue: string, id: string): ApiError {
   });
 }
 
+/** Serialize a payload and enforce the configured message-size limit. */
+function encodePayload(data: Json, maxMessageBytes: number): string {
+  const dataJson = JSON.stringify(data);
+  if (Buffer.byteLength(dataJson, "utf8") > maxMessageBytes) {
+    throw ApiError.validation(`Message payload exceeds the ${String(maxMessageBytes)} byte limit.`);
+  }
+  return dataJson;
+}
+
+/** Decode a stored payload; corrupt Redis data is an internal error. */
+function decodePayload(raw: string | undefined): Json {
+  try {
+    return JSON.parse(raw ?? "null") as Json;
+  } catch {
+    throw ApiError.internal("Stored message payload is corrupt.");
+  }
+}
+
+/**
+ * Parse an ack/requeue reply: OK returns the full parts array, missing and
+ * conflicting leases throw the same errors as the individual callers.
+ */
+function settleReply(
+  reply: unknown,
+  script: string,
+  queue: string,
+  id: string,
+  verb: string,
+): unknown[] {
+  const parts = asArray(reply, script);
+  const status = asString(parts[0], script);
+  if (status === "OK") return parts;
+  if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
+  const state = asString(parts[1] ?? "", script);
+  throw new ApiError(
+    "CONFLICT",
+    `Cannot ${verb} message '${id}' while it is ${state === "" ? "unavailable" : state}.`,
+    { resource: { type: "message", id, queue } },
+  );
+}
+
+/** Parse a delete/TTL reply: waiting states share the same two failures. */
+function waitingReply(reply: unknown, script: string, queue: string, id: string): unknown[] {
+  const parts = asArray(reply, script);
+  const status = asString(parts[0], script);
+  if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
+  if (status === "CONFLICT") throw unackedConflict(queue, id);
+  return parts;
+}
+
 function parseMessageHash(record: Record<string, string>, queue: string): BrokerMessage {
   const stateRaw = record["state"];
   if (!isMessageState(stateRaw)) {
     throw ApiError.internal("Unexpected message state in backend.");
   }
-  let data: Json;
-  try {
-    data = JSON.parse(record["data"] ?? "null") as Json;
-  } catch {
-    throw ApiError.internal("Stored message payload is corrupt.");
-  }
+  const data = decodePayload(record["data"]);
   const consumer = record["consumer"] ?? "";
   return {
     id: record["id"] ?? "",
@@ -455,12 +500,7 @@ export class BrokerService {
   }
 
   async publish(queue: string, data: Json, opts: PublishOptions): Promise<PublishedMessage> {
-    const dataJson = JSON.stringify(data);
-    if (Buffer.byteLength(dataJson, "utf8") > this.options.maxMessageBytes) {
-      throw ApiError.validation(
-        `Message payload exceeds the ${String(this.options.maxMessageBytes)} byte limit.`,
-      );
-    }
+    const dataJson = encodePayload(data, this.options.maxMessageBytes);
     const keys = queueKeys(this.options.prefix, queue);
     const ttlMs = opts.ttlMs ?? 0;
     const now = Date.now();
@@ -587,14 +627,8 @@ export class BrokerService {
     const messages = [];
     for (let i = 0; i < delivered; i += 1) {
       const id = asString(parts[3 + i * 3], "consume");
-      const dataRaw = asString(parts[3 + i * 3 + 1], "consume");
+      const data = decodePayload(asString(parts[3 + i * 3 + 1], "consume"));
       const deliveries = asNumber(parts[3 + i * 3 + 2], "consume");
-      let data: Json;
-      try {
-        data = JSON.parse(dataRaw) as Json;
-      } catch {
-        throw ApiError.internal("Stored message payload is corrupt.");
-      }
       messages.push({
         id,
         queue,
@@ -629,15 +663,8 @@ export class BrokerService {
   async requeue(queue: string, id: string, opts: RequeueOptions = {}): Promise<RequeuedMessage> {
     const keys = queueKeys(this.options.prefix, queue);
     const now = Date.now();
-    let dataJson = "";
-    if (opts.data !== undefined) {
-      dataJson = JSON.stringify(opts.data);
-      if (Buffer.byteLength(dataJson, "utf8") > this.options.maxMessageBytes) {
-        throw ApiError.validation(
-          `Message payload exceeds the ${String(this.options.maxMessageBytes)} byte limit.`,
-        );
-      }
-    }
+    const dataJson =
+      opts.data === undefined ? "" : encodePayload(opts.data, this.options.maxMessageBytes);
     const availableAt = now + (opts.ttlMs ?? 0);
     let reply: unknown;
     try {
@@ -668,42 +695,24 @@ export class BrokerService {
     id: string,
     verb: string,
   ): number {
-    const parts = asArray(reply, script);
-    const status = asString(parts[0], script);
-    if (status === "OK") return asNumber(parts[1], script);
-    if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
-    const state = asString(parts[1] ?? "", script);
-    throw new ApiError(
-      "CONFLICT",
-      `Cannot ${verb} message '${id}' while it is ${state === "" ? "unavailable" : state}.`,
-      { resource: { type: "message", id, queue } },
-    );
+    const parts = settleReply(reply, script, queue, id, verb);
+    return asNumber(parts[1], script);
   }
 
   private settledRequeue(reply: unknown, queue: string, id: string): RequeuedMessage {
-    const parts = asArray(reply, "requeue");
-    const status = asString(parts[0], "requeue");
-    if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
-    if (status === "OK") {
-      const state = asString(parts[2], "requeue");
-      if (!isMessageState(state) || (state !== "ready" && state !== "delayed")) {
-        throw ApiError.internal("Unexpected reply from requeue.");
-      }
-      return {
-        id,
-        queue,
-        requeued: true,
-        state,
-        availableAt: asNumber(parts[3], "requeue"),
-        deliveries: asNumber(parts[1], "requeue"),
-      };
+    const parts = settleReply(reply, "requeue", queue, id, "requeue");
+    const state = asString(parts[2], "requeue");
+    if (!isMessageState(state) || (state !== "ready" && state !== "delayed")) {
+      throw ApiError.internal("Unexpected reply from requeue.");
     }
-    const state = asString(parts[1] ?? "", "requeue");
-    throw new ApiError(
-      "CONFLICT",
-      `Cannot requeue message '${id}' while it is ${state === "" ? "unavailable" : state}.`,
-      { resource: { type: "message", id, queue } },
-    );
+    return {
+      id,
+      queue,
+      requeued: true,
+      state,
+      availableAt: asNumber(parts[3], "requeue"),
+      deliveries: asNumber(parts[1], "requeue"),
+    };
   }
 
   async deleteMessage(queue: string, id: string): Promise<{ state: MessageState }> {
@@ -720,12 +729,7 @@ export class BrokerService {
     } catch (err) {
       throw classifyBackendError(err, "delete message");
     }
-    const parts = asArray(reply, "deleteMessage");
-    const status = asString(parts[0], "deleteMessage");
-    if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
-    if (status === "CONFLICT") {
-      throw unackedConflict(queue, id);
-    }
+    const parts = waitingReply(reply, "deleteMessage", queue, id);
     const state = asString(parts[1], "deleteMessage");
     if (!isMessageState(state)) throw ApiError.internal("Unexpected reply from deleteMessage.");
     return { state };
@@ -753,12 +757,7 @@ export class BrokerService {
     } catch (err) {
       throw classifyBackendError(err, "change message TTL");
     }
-    const parts = asArray(reply, "setTtl");
-    const status = asString(parts[0], "setTtl");
-    if (status === "NOT_FOUND") throw ApiError.notFound("message", id, queue);
-    if (status === "CONFLICT") {
-      throw unackedConflict(queue, id);
-    }
+    const parts = waitingReply(reply, "setTtl", queue, id);
     const state = asString(parts[1], "setTtl");
     if (!isMessageState(state)) throw ApiError.internal("Unexpected reply from setTtl.");
     this.notifyChanged(queue);
