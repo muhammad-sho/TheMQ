@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import WebSocket from "ws";
 import type {
   IDataObject,
@@ -10,7 +11,19 @@ import type {
   ITriggerResponse,
 } from "n8n-workflow";
 import { NodeConnectionTypes, NodeOperationError } from "n8n-workflow";
-import { describeApiError, normalizeBaseUrl } from "../TheMq/TheMq.node.js";
+import {
+  describeApiError,
+  errorMessage,
+  isAlreadySettled,
+  isFatalConnectionError,
+} from "../shared/errors.js";
+import {
+  frameString,
+  parseDeliveredMessage,
+  parseFrame,
+  type DeliveredMessage,
+} from "../shared/frames.js";
+import { normalizeBaseUrl } from "../shared/http.js";
 
 type AcknowledgeMode =
   "immediately" | "executionFinishes" | "executionFinishesSuccessfully" | "laterMessageNode";
@@ -23,13 +36,6 @@ interface TriggerOptions {
 interface TheMqCredentials {
   baseUrl?: string;
   apiToken?: string;
-}
-
-interface DeliveredMessage {
-  id: string;
-  data: unknown;
-  deliveryCount: number;
-  redelivered: boolean;
 }
 
 interface ReadyInfo {
@@ -59,48 +65,6 @@ const RECONNECT_JITTER_MS = 1000;
  * server rejections no retry can fix (auth/queue/protocol).
  */
 const NO_RECONNECT_CLOSE = new Set([WS_NORMAL_CLOSE, 4400, 4404, 4410]);
-
-/** Permanent connection failures (bad credentials, gone queue): surface, don't loop. */
-function isFatalConnectionError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /401|unauthorized|NOT_FOUND/i.test(message);
-}
-
-/** A message the broker failed to settle because it is already gone. */
-function isAlreadySettled(error: unknown): boolean {
-  if (typeof error !== "object" || error === null) return false;
-  const message = (error as { message?: unknown }).message;
-  return (
-    typeof message === "string" && (message.includes("NOT_FOUND") || message.includes("CONFLICT"))
-  );
-}
-
-/** Narrow an unknown frame field to a string (never stringifies objects). */
-function frameString(value: unknown): string {
-  return typeof value === "string" ? value : "";
-}
-
-function frameText(raw: WebSocket.RawData): string {
-  if (typeof raw === "string") return raw;
-  if (Array.isArray(raw)) return Buffer.concat(raw).toString("utf8");
-  if (raw instanceof ArrayBuffer) return Buffer.from(raw).toString("utf8");
-  return raw.toString("utf8");
-}
-
-/** Extract a delivered message from a parsed frame (undefined = not a message). */
-function parseDeliveredMessage(frame: IDataObject): DeliveredMessage | undefined {
-  if (frame["type"] !== "message" || typeof frame["id"] !== "string") return undefined;
-  return {
-    id: frame["id"],
-    data: frame["data"],
-    deliveryCount: typeof frame["deliveryCount"] === "number" ? frame["deliveryCount"] : 1,
-    redelivered: frame["redelivered"] === true,
-  };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 /** Connect failure in plain language (raw socket errors are cryptic). */
 function describeConnectionError(error: unknown, queue: string, baseUrl: string): string {
@@ -240,7 +204,7 @@ export class TheMqTrigger implements INodeType {
       if (maxConcurrent > MAX_CONCURRENT_CAP) {
         throw new NodeOperationError(
           this.getNode(),
-          "Max Concurrent Executions must be at most 1000.",
+          `Max Concurrent Executions must be at most ${MAX_CONCURRENT_CAP}.`,
         );
       }
     }
@@ -283,22 +247,21 @@ export class TheMqTrigger implements INodeType {
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     let reconnectDelayMs = RECONNECT_INITIAL_MS;
 
-    const logError = (message: string): void => {
+    const log = (level: "error" | "warn", message: string): void => {
       const workflow = this.getWorkflow();
       const node = this.getNode();
-      this.logger.error(
-        `There was a problem with TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
-        { node: node.name, workflowId: workflow.id },
-      );
-    };
-
-    const logWarn = (message: string): void => {
-      const workflow = this.getWorkflow();
-      const node = this.getNode();
-      this.logger.warn(
-        `TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
-        { node: node.name, workflowId: workflow.id },
-      );
+      const context = { node: node.name, workflowId: workflow.id };
+      if (level === "error") {
+        this.logger.error(
+          `There was a problem with TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
+          context,
+        );
+      } else {
+        this.logger.warn(
+          `TheMQ Trigger node "${node.name}" in workflow "${workflow.id}": "${message}"`,
+          context,
+        );
+      }
     };
 
     const openSocket = async (): Promise<WebSocket> => {
@@ -351,16 +314,12 @@ export class TheMqTrigger implements INodeType {
           candidate.off("close", onClose);
         };
         const onFrame = (raw: WebSocket.RawData): void => {
-          let frame: IDataObject;
-          try {
-            frame = JSON.parse(frameText(raw)) as IDataObject;
-          } catch {
-            return;
-          }
+          const frame = parseFrame(raw);
+          if (frame === undefined) return;
           if (frame["type"] === "ready" && typeof frame["consumerId"] === "string") {
             cleanup();
             resolve({ consumerId: frame["consumerId"], early });
-          } else if (frame["type"] === "message" && typeof frame["id"] === "string") {
+          } else if (frame["type"] === "message") {
             const delivered = parseDeliveredMessage(frame);
             if (delivered) early.push(delivered);
           } else if (frame["type"] === "error") {
@@ -411,19 +370,11 @@ export class TheMqTrigger implements INodeType {
       });
     };
 
-    const settleAck = async (id: string): Promise<void> => {
+    const settle = async (action: "ack" | "requeue", id: string): Promise<void> => {
       try {
-        await sendSettle("ack", id);
+        await sendSettle(action, id);
       } catch (error) {
         // Already settled elsewhere — nothing left to do.
-        if (!isAlreadySettled(error)) throw error;
-      }
-    };
-
-    const settleRequeue = async (id: string): Promise<void> => {
-      try {
-        await sendSettle("requeue", id);
-      } catch (error) {
         if (!isAlreadySettled(error)) throw error;
       }
     };
@@ -461,7 +412,7 @@ export class TheMqTrigger implements INodeType {
         const item = toItem(message);
         if (acknowledgeMode === "immediately") {
           this.emit([[item]]);
-          await settleAck(message.id);
+          await settle("ack", message.id);
           return;
         }
         if (acknowledgeMode === "laterMessageNode") {
@@ -480,13 +431,13 @@ export class TheMqTrigger implements INodeType {
             responsePromise.promise.then((data): RaceResult => ({ kind: "run", data })),
           ]);
           if (first.kind === "hook" && first.real) {
-            await settleAck(message.id);
+            await settle("ack", message.id);
           } else {
             const run = first.kind === "run" ? first.data : await responsePromise.promise;
             if (run?.data?.resultData?.error) {
-              await settleRequeue(message.id);
+              await settle("requeue", message.id);
             } else {
-              await settleAck(message.id);
+              await settle("ack", message.id);
             }
           }
           return;
@@ -496,28 +447,22 @@ export class TheMqTrigger implements INodeType {
         const run = await responsePromise.promise;
         if (run?.data?.resultData?.error) {
           if (acknowledgeMode === "executionFinishesSuccessfully") {
-            await settleRequeue(message.id);
+            await settle("requeue", message.id);
             return;
           }
         }
-        await settleAck(message.id);
+        await settle("ack", message.id);
       } catch (error) {
-        logError(
-          `message "${message.id}": ${error instanceof Error ? error.message : String(error)}`,
-        );
+        log("error", `message "${message.id}": ${errorMessage(error)}`);
       } finally {
         inflight.delete(message.id);
       }
     };
 
     const onSocketFrame = (raw: WebSocket.RawData): void => {
-      let frame: IDataObject;
-      try {
-        frame = JSON.parse(frameText(raw)) as IDataObject;
-      } catch {
-        return;
-      }
-      if (frame["type"] === "message" && typeof frame["id"] === "string") {
+      const frame = parseFrame(raw);
+      if (frame === undefined) return;
+      if (frame["type"] === "message") {
         const delivered = parseDeliveredMessage(frame);
         if (delivered) void handleMessage(delivered);
         return;
@@ -527,9 +472,16 @@ export class TheMqTrigger implements INodeType {
         if (frame["type"] === "error" && frame["id"] === undefined) {
           const code = frameString(frame["code"]) || "ERROR";
           const message = frameString(frame["message"]);
-          logError(message === "" ? `TheMQ ${code}` : `TheMQ ${code}: ${message}`);
+          log("error", message === "" ? `TheMQ ${code}` : `TheMQ ${code}: ${message}`);
         }
       }
+    };
+
+    const rejectPendingSettles = (message: string): void => {
+      for (const [, pending] of pendingSettles) {
+        pending.reject(new Error(message));
+      }
+      pendingSettles.clear();
     };
 
     const closeFunction = async (): Promise<void> => {
@@ -544,10 +496,7 @@ export class TheMqTrigger implements INodeType {
       while (inflight.size > 0 && waits++ < CLOSE_WAIT_MAX_ROUNDS) {
         await sleep(CLOSE_WAIT_INTERVAL_MS);
       }
-      for (const [, pending] of pendingSettles) {
-        pending.reject(new Error("TheMQ Trigger is closing"));
-      }
-      pendingSettles.clear();
+      rejectPendingSettles("TheMQ Trigger is closing");
       const current = socket;
       socket = undefined;
       if (current) {
@@ -585,14 +534,11 @@ export class TheMqTrigger implements INodeType {
         candidate.on("message", onSocketFrame);
       }
       candidate.on("error", (err: Error) => {
-        logError(err.message);
+        log("error", err.message);
       });
       candidate.on("close", (code: number) => {
         if (socket === candidate) socket = undefined;
-        for (const [, pending] of pendingSettles) {
-          pending.reject(new Error("TheMQ connection closed"));
-        }
-        pendingSettles.clear();
+        rejectPendingSettles("TheMQ connection closed");
         if (closeRequested) return;
         // Manual test runs fail visibly; the live trigger rides out
         // transport drops (server restarts, deploys, blips) by
@@ -632,24 +578,24 @@ export class TheMqTrigger implements INodeType {
       if (closeRequested || isManualRun || reconnectTimer !== undefined) return;
       const wait = reconnectDelayMs + Math.floor(Math.random() * RECONNECT_JITTER_MS);
       reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_MS);
-      logWarn(`connection lost; reconnecting in ${(wait / 1000).toFixed(1)}s`);
+      log("warn", `connection lost; reconnecting in ${(wait / 1000).toFixed(1)}s`);
       reconnectTimer = setTimeout(() => {
         reconnectTimer = undefined;
         if (closeRequested) return;
         establish().catch((error: unknown) => {
           if (closeRequested) return;
-          const message = error instanceof Error ? error.message : String(error);
+          const message = errorMessage(error);
           if (isFatalConnectionError(error)) {
             this.emitError(new Error(message));
             return;
           }
-          logWarn(`reconnect failed (${message}); retrying`);
+          log("warn", `reconnect failed (${message}); retrying`);
           scheduleReconnect();
         });
       }, wait);
     };
 
-    if (this.getMode() === "manual") {
+    if (isManualRun) {
       const manualTriggerFunction = async (): Promise<void> => {
         // Catch one message for the editor test run, then disconnect.
         // No execution hooks here: the test run settles it immediately.
@@ -665,13 +611,9 @@ export class TheMqTrigger implements INodeType {
                   return;
                 }
                 const onFrame = (raw: WebSocket.RawData): void => {
-                  let frame: IDataObject;
-                  try {
-                    frame = JSON.parse(frameText(raw)) as IDataObject;
-                  } catch {
-                    return;
-                  }
-                  if (frame["type"] === "message" && typeof frame["id"] === "string") {
+                  const frame = parseFrame(raw);
+                  if (frame === undefined) return;
+                  if (frame["type"] === "message") {
                     const delivered = parseDeliveredMessage(frame);
                     if (delivered) {
                       current.off("message", onFrame);
@@ -683,10 +625,8 @@ export class TheMqTrigger implements INodeType {
               });
         if (first) {
           this.emit([[toItem(first)]]);
-          await settleAck(first.id).catch((error: unknown) => {
-            logError(
-              `message "${first.id}": ${error instanceof Error ? error.message : String(error)}`,
-            );
+          await settle("ack", first.id).catch((error: unknown) => {
+            log("error", `message "${first.id}": ${errorMessage(error)}`);
           });
         }
         await closeFunction();

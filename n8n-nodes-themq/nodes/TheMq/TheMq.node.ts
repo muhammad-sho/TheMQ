@@ -1,32 +1,22 @@
 import type {
   IDataObject,
   IExecuteFunctions,
-  NodeParameterValueType,
   IHttpRequestMethods,
   INodeExecutionData,
   INodeType,
   INodeTypeDescription,
 } from "n8n-workflow";
 import { NodeConnectionTypes, NodeOperationError } from "n8n-workflow";
-
-/** Narrow an API value to n8n's item-data type. */
-function toDataObject(value: unknown): IDataObject {
-  if (typeof value === "object" && value !== null) return value as IDataObject;
-  return {};
-}
-
-/** Narrow node parameters explicitly. */
-function strParam(value: NodeParameterValueType | object, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
-}
-
-function numParam(value: NodeParameterValueType | object, fallback: number): number {
-  return typeof value === "number" ? value : fallback;
-}
-
-function boolParam(value: NodeParameterValueType | object, fallback = false): boolean {
-  return typeof value === "boolean" ? value : fallback;
-}
+import { apiCodeOf, describeApiError, errorMessage } from "../shared/errors.js";
+import {
+  messageActionPath,
+  messagePath,
+  messagesPath,
+  normalizeBaseUrl,
+  type RequestContext,
+} from "../shared/http.js";
+import { buildPublishBody, buildRequeueBody, type PublishOptions } from "../shared/messages.js";
+import { boolParam, numParam, strParam, toDataObject } from "../shared/params.js";
 
 export class TheMq implements INodeType {
   description: INodeTypeDescription = {
@@ -196,31 +186,20 @@ export class TheMq implements INodeType {
           });
         }
         if (operation === "publish") {
-          const dataParam: unknown = this.getNodeParameter("messageData", i);
-          let data: unknown;
-          if (typeof dataParam === "string") {
-            try {
-              data = JSON.parse(dataParam) as unknown;
-            } catch {
-              throw new NodeOperationError(this.getNode(), "Message Data is not valid JSON.", {
-                itemIndex: i,
-              });
-            }
-          } else {
-            data = dataParam;
-          }
+          const data = parseMessageData(this, this.getNodeParameter("messageData", i), i);
           const ttlMs = numParam(this.getNodeParameter("ttlMs", i, 0), 0);
           const upsert = boolParam(this.getNodeParameter("upsert", i, false));
           const onConflict = strParam(this.getNodeParameter("onConflict", i, "error"), "error");
-          const body: Record<string, unknown> = { id: messageId, data };
-          if (ttlMs > 0) body["ttlMs"] = ttlMs;
-          if (upsert) body["upsert"] = true;
-          if (onConflict === "skip") body["onConflict"] = "skip";
-          const response = await request.call(
+          const response = await publishMessage(
             this,
-            "POST",
-            `/queues/${encode(queue)}/messages`,
-            body,
+            queue,
+            messageId,
+            data,
+            {
+              ttlMs: ttlMs > 0 ? ttlMs : undefined,
+              upsert,
+              onConflict: onConflict === "skip" ? "skip" : undefined,
+            },
             { itemIndex: i, operation, queue, messageId },
           );
           returnData.push({ json: toDataObject(response) });
@@ -229,7 +208,7 @@ export class TheMq implements INodeType {
             await request.call(
               this,
               "POST",
-              `/queues/${encode(queue)}/messages/${encode(messageId)}/ack`,
+              messageActionPath(queue, messageId, "ack"),
               undefined,
               { itemIndex: i, operation, queue, messageId },
             ),
@@ -247,66 +226,49 @@ export class TheMq implements INodeType {
             messageData?: unknown;
             ttlMs?: number;
           };
-          let replacement: unknown;
-          let hasReplacement = false;
-          if (options.messageData !== undefined) {
-            const dataParam: unknown = options.messageData;
-            if (typeof dataParam === "string") {
-              try {
-                replacement = JSON.parse(dataParam) as unknown;
-              } catch {
-                throw new NodeOperationError(this.getNode(), "Message Data is not valid JSON.", {
-                  itemIndex: i,
-                });
-              }
-            } else {
-              replacement = dataParam;
-            }
-            hasReplacement = true;
-          }
+          const hasReplacement = options.messageData !== undefined;
+          const replacement = hasReplacement
+            ? parseMessageData(this, options.messageData, i)
+            : undefined;
           const delayMs =
             typeof options.ttlMs === "number" && options.ttlMs > 0
               ? Math.floor(options.ttlMs)
               : undefined;
-          const requeueBody: Record<string, unknown> = {
-            ...(hasReplacement ? { data: replacement } : {}),
-            ...(delayMs !== undefined ? { ttlMs: delayMs } : {}),
-          };
-          const requeuePath = `/queues/${encode(queue)}/messages/${encode(messageId)}/requeue`;
+          const requeueBody = buildRequeueBody(replacement, hasReplacement, delayMs);
           const requestContext = { itemIndex: i, operation, queue, messageId };
           try {
-            const response = await request.call(this, "POST", requeuePath, requeueBody, {
-              ...requestContext,
-            });
+            const response = await requeueMessage(
+              this,
+              queue,
+              messageId,
+              requeueBody,
+              requestContext,
+            );
             returnData.push({ json: toDataObject(response) });
           } catch (requeueError) {
             // Forgiving requeue: the fast path above covers the normal
             // leased case in one call. Anything else (already waiting,
             // never published) is resolved into "queued" instead of
             // surfacing a state error.
-            const ensured = await ensureQueued(
-              this,
+            const ensured = await ensureQueued(this, {
+              itemIndex: i,
               queue,
               messageId,
-              hasReplacement ? replacement : undefined,
+              replacement,
               hasReplacement,
               delayMs,
-              toDataObject(items[i]?.json ?? {}),
-              requeueBody,
-              requeuePath,
-              requestContext,
+              itemJson: toDataObject(items[i]?.json ?? {}),
               requeueError,
-            );
+            });
             returnData.push({ json: ensured });
           }
         } else if (operation === "delete") {
-          await request.call(
-            this,
-            "DELETE",
-            `/queues/${encode(queue)}/messages/${encode(messageId)}`,
-            undefined,
-            { itemIndex: i, operation, queue, messageId },
-          );
+          await request.call(this, "DELETE", messagePath(queue, messageId), undefined, {
+            itemIndex: i,
+            operation,
+            queue,
+            messageId,
+          });
           returnData.push({ json: { queue, messageId, deleted: true } });
         } else {
           throw new NodeOperationError(this.getNode(), `Unknown operation "${operation}".`, {
@@ -316,7 +278,7 @@ export class TheMq implements INodeType {
       } catch (error) {
         if (this.continueOnFail()) {
           returnData.push({
-            json: { error: error instanceof Error ? error.message : String(error) },
+            json: { error: errorMessage(error) },
             pairedItem: { item: i },
           });
           continue;
@@ -328,22 +290,44 @@ export class TheMq implements INodeType {
   }
 }
 
-function encode(value: string): string {
-  return encodeURIComponent(value);
+function parseMessageData(context: IExecuteFunctions, value: unknown, itemIndex: number): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new NodeOperationError(context.getNode(), "Message Data is not valid JSON.", {
+      itemIndex,
+    });
+  }
 }
 
-/** TheMQ error code from a formatted node error (undefined = transport/unknown). */
-function apiCodeOf(error: unknown): string | undefined {
-  const message = error instanceof Error ? error.message : String(error);
-  const named = /TheMQ ([A-Z_]+):/.exec(message)?.[1];
-  if (named !== undefined && named !== "HTTP") return named;
-  // n8n versions differ in how much of the API body survives on the
-  // error object; when only the status text remains ("TheMQ HTTP 404:
-  // ..."), map the status back to its stable code.
-  const status = /TheMQ HTTP (\d+)/.exec(message)?.[1];
-  if (status === "404") return "NOT_FOUND";
-  if (status === "409") return "CONFLICT";
-  return undefined;
+async function publishMessage(
+  context: IExecuteFunctions,
+  queue: string,
+  messageId: string,
+  data: unknown,
+  options: PublishOptions,
+  requestContext: RequestContext,
+): Promise<IDataObject> {
+  return request.call(
+    context,
+    "POST",
+    messagesPath(queue),
+    buildPublishBody(messageId, data, options),
+    { ...requestContext },
+  );
+}
+
+async function requeueMessage(
+  context: IExecuteFunctions,
+  queue: string,
+  messageId: string,
+  body: Record<string, unknown>,
+  requestContext: RequestContext,
+): Promise<IDataObject> {
+  return request.call(context, "POST", messageActionPath(queue, messageId, "requeue"), body, {
+    ...requestContext,
+  });
 }
 
 /** GET a message; undefined when it does not exist. Other failures throw. */
@@ -355,18 +339,25 @@ async function fetchMessage(
 ): Promise<IDataObject | undefined> {
   try {
     return toDataObject(
-      await request.call(
-        context,
-        "GET",
-        `/queues/${encode(queue)}/messages/${encode(messageId)}`,
-        undefined,
-        { ...requestContext },
-      ),
+      await request.call(context, "GET", messagePath(queue, messageId), undefined, {
+        ...requestContext,
+      }),
     );
   } catch (error) {
     if (apiCodeOf(error) === "NOT_FOUND") return undefined;
     throw error;
   }
+}
+
+interface EnsureQueuedInput {
+  itemIndex: number;
+  queue: string;
+  messageId: string;
+  replacement: unknown;
+  hasReplacement: boolean;
+  delayMs: number | undefined;
+  itemJson: IDataObject;
+  requeueError: unknown;
 }
 
 /**
@@ -377,19 +368,13 @@ async function fetchMessage(
  */
 async function ensureQueued(
   context: IExecuteFunctions,
-  queue: string,
-  messageId: string,
-  replacement: unknown,
-  hasReplacement: boolean,
-  delayMs: number | undefined,
-  itemJson: IDataObject,
-  requeueBody: Record<string, unknown>,
-  requeuePath: string,
-  requestContext: RequestContext,
-  requeueError: unknown,
+  input: EnsureQueuedInput,
 ): Promise<IDataObject> {
-  const code = apiCodeOf(requeueError);
-  if (code !== "NOT_FOUND" && code !== "CONFLICT") throw requeueError;
+  const { itemIndex, queue, messageId, replacement, hasReplacement, delayMs, itemJson } = input;
+  const code = apiCodeOf(input.requeueError);
+  if (code !== "NOT_FOUND" && code !== "CONFLICT") throw input.requeueError;
+  const requestContext: RequestContext = { itemIndex, operation: "requeue", queue, messageId };
+  const requeueBody = buildRequeueBody(replacement, hasReplacement, delayMs);
   const current = await fetchMessage(context, queue, messageId, requestContext);
   if (current === undefined) {
     // Never published (or already gone): publish it. The trigger item
@@ -400,22 +385,21 @@ async function ensureQueued(
       throw new NodeOperationError(
         context.getNode(),
         `TheMQ NOT_FOUND: message "${messageId}" does not exist in queue "${queue}" and no replacement payload was provided. Add Message Data to the Requeue Options to create it.`,
-        { itemIndex: requestContext.itemIndex },
+        { itemIndex },
       );
     }
     try {
-      const published = await request.call(
+      const published = await publishMessage(
         context,
-        "POST",
-        `/queues/${encode(queue)}/messages`,
+        queue,
+        messageId,
+        payload,
         {
-          id: messageId,
-          data: payload,
-          ...(delayMs !== undefined ? { ttlMs: delayMs } : {}),
+          ttlMs: delayMs,
           // Tolerate a race that created the message after the GET.
           upsert: true,
         },
-        { ...requestContext },
+        requestContext,
       );
       return { ...toDataObject(published), queued: true };
     } catch (publishError) {
@@ -423,9 +407,7 @@ async function ensureQueued(
         // Lost the race: the message is leased now, so the requeue
         // that just failed will succeed on the new terms.
         return toDataObject(
-          await request.call(context, "POST", requeuePath, requeueBody, {
-            ...requestContext,
-          }),
+          await requeueMessage(context, queue, messageId, requeueBody, requestContext),
         );
       }
       throw publishError;
@@ -435,9 +417,7 @@ async function ensureQueued(
     // Changed under us between the requeue and the GET: one retry on
     // the current terms instead of reporting a stale state.
     return toDataObject(
-      await request.call(context, "POST", requeuePath, requeueBody, {
-        ...requestContext,
-      }),
+      await requeueMessage(context, queue, messageId, requeueBody, requestContext),
     );
   }
   // Already waiting (ready/delayed): success without moving it, unless
@@ -459,17 +439,13 @@ async function ensureQueued(
     // Waiting messages hold no lease, so upsert is the data path; it
     // resets the delivery count, which is 0 for never-delivered work.
     try {
-      const published = await request.call(
+      const published = await publishMessage(
         context,
-        "POST",
-        `/queues/${encode(queue)}/messages`,
-        {
-          id: messageId,
-          data: replacement,
-          ...(delayMs !== undefined ? { ttlMs: delayMs } : {}),
-          upsert: true,
-        },
-        { ...requestContext },
+        queue,
+        messageId,
+        replacement,
+        { ttlMs: delayMs, upsert: true },
+        requestContext,
       );
       return { ...toDataObject(published), alreadyQueued: true };
     } catch (publishError) {
@@ -477,9 +453,7 @@ async function ensureQueued(
         // Leased between the GET and the publish: requeue on the new
         // terms once instead of failing.
         return toDataObject(
-          await request.call(context, "POST", requeuePath, requeueBody, {
-            ...requestContext,
-          }),
+          await requeueMessage(context, queue, messageId, requeueBody, requestContext),
         );
       }
       throw publishError;
@@ -490,24 +464,11 @@ async function ensureQueued(
   const moved = await request.call(
     context,
     "PUT",
-    `/queues/${encode(queue)}/messages/${encode(messageId)}/ttl`,
+    messageActionPath(queue, messageId, "ttl"),
     { ttl: delayMs },
     { ...requestContext },
   );
   return { queue, messageId, requeued: false, alreadyQueued: true, ...toDataObject(moved) };
-}
-
-/** Strip trailing slashes so `baseUrl + path` never doubles them. */
-export function normalizeBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, "");
-}
-
-export interface RequestContext {
-  itemIndex: number;
-  operation: string;
-  queue?: string;
-  messageId?: string;
-  baseUrl?: string;
 }
 
 async function request(
@@ -536,73 +497,4 @@ async function request(
       itemIndex: context.itemIndex,
     });
   }
-}
-
-/** One-line remediation per TheMQ error code (empty = the message says it all). */
-function hintForCode(code: string, operation: string, message: string): string {
-  switch (code) {
-    case "UNAUTHENTICATED":
-      return "Check the API Token in your TheMQ API credential.";
-    case "NOT_FOUND":
-      return "The queue or message does not exist, or was already removed.";
-    case "CONFLICT":
-      if (operation === "publish") {
-        if (/unacked|lease/i.test(message)) {
-          return "The message is leased to a consumer. Set On Conflict to Skip, or wait for the lease to settle.";
-        }
-        return "A message with this ID already exists. Enable Upsert to update it, or set On Conflict to Skip.";
-      }
-      if (operation === "ack") {
-        return "The message is not leased. It may already be settled, or never picked up yet.";
-      }
-      if (operation === "requeue") {
-        return "The message could not be returned to the queue. It may have been settled concurrently — run the node again.";
-      }
-      return "The message is leased (unacked). Acknowledge it first.";
-    case "SERVICE_UNAVAILABLE":
-      return "TheMQ cannot reach its Redis backend. Check that TheMQ and Redis are running.";
-    default:
-      return "";
-  }
-}
-
-export function describeApiError(
-  error: unknown,
-  context: { operation: string; queue?: string; messageId?: string; baseUrl?: string },
-): string {
-  const where = [context.operation, context.queue ? `queue "${context.queue}"` : ""]
-    .filter((part) => part !== "")
-    .join(" ");
-  const id = context.messageId ? ` message "${context.messageId}"` : "";
-  const record = (typeof error === "object" && error !== null ? error : {}) as {
-    message?: unknown;
-    description?: unknown;
-    httpCode?: unknown;
-    response?: { data?: unknown };
-    cause?: { response?: { data?: unknown } };
-    context?: { data?: unknown };
-  };
-  // n8n's message is generic per-status text; the real TheMQ body
-  // survives at response.data, cause.response.data, or context.data.
-  const bodies = [record.response?.data, record.cause?.response?.data, record.context?.data];
-  for (const body of bodies) {
-    if (typeof body !== "object" || body === null || !("error" in body)) continue;
-    const apiError = (body as { error?: unknown }).error;
-    if (typeof apiError !== "object" || apiError === null) continue;
-    const { code, message } = apiError as { code?: unknown; message?: unknown };
-    if (typeof code === "string" && typeof message === "string") {
-      const hint = hintForCode(code, context.operation, message);
-      return `TheMQ ${code}: ${message} [${where}${id}]${hint === "" ? "" : ` ${hint}`}`;
-    }
-  }
-  // Error status with an unfamiliar body: n8n copies the text into `description`.
-  const httpCode = typeof record.httpCode === "string" ? record.httpCode : "";
-  const description = typeof record.description === "string" ? record.description : "";
-  if (httpCode !== "" && description !== "") {
-    return `TheMQ HTTP ${httpCode}: ${description} [${where}${id}]`;
-  }
-  // No API body: transport-level failure (DNS, refused, timeout, proxy).
-  const message = typeof record.message === "string" ? record.message : "";
-  const at = context.baseUrl ? ` at ${context.baseUrl}` : "";
-  return `TheMQ is not reachable${at} [${where}${id}]${message === "" ? "" : `: ${message}`} Check that TheMQ is running and the Base URL in your credential is correct.`;
 }

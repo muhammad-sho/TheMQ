@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from "node:timers/promises";
 import type { Logger } from "../logging/logger.js";
 
 /**
@@ -59,10 +60,6 @@ export async function applyRedisServerTuning(
   );
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /** Snapshot retry budget while a background save is already running. */
 const BGSAVE_MAX_ATTEMPTS = 6;
 const BGSAVE_RETRY_DELAY_MS = 2000;
@@ -77,7 +74,7 @@ async function bgsaveWhenIdle(client: TuningClient, logger?: Logger): Promise<vo
         err instanceof Error
           ? /already in progress|in progress|schedule/i.test(err.message)
           : false;
-      if (busy && attempt < 5) {
+      if (busy && attempt < BGSAVE_MAX_ATTEMPTS - 1) {
         await sleep(BGSAVE_RETRY_DELAY_MS);
         continue;
       }
